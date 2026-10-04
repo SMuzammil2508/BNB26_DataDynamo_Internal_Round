@@ -175,7 +175,7 @@ const videoAnalysisResponseSchema: Schema = {
   properties: {
     transcript: {
       type: Type.STRING,
-      description: "Full timestamped transcript with lines formatted exactly as '[MM:SS] text'.",
+      description: "Full timestamped transcript with lines formatted exactly as '[MM:SS] spoken text'.",
     },
     scenes: {
       type: Type.ARRAY,
@@ -432,28 +432,30 @@ export async function analyzeVideo(input: VideoAnalysisInput): Promise<VideoAnal
 
   try {
     let targetUri = fileUri;
-    let targetMimeType = mimeType || "video/mp4";
+    const targetMimeType = mimeType || "video/mp4";
 
     // Handle local file upload
     if (!targetUri && filePath) {
       const uploadResult = await client.files.upload({
         file: filePath,
         mimeType: targetMimeType,
-      });
+      } as Parameters<typeof client.files.upload>[0]);
       uploadedFileName = uploadResult.name;
       targetUri = uploadResult.uri;
 
       // Poll until file state is ACTIVE
-      let fileInfo = await client.files.get({ name: uploadResult.name });
-      let attempts = 0;
-      while (fileInfo.state === "PROCESSING" && attempts < 30) {
-        await new Promise((resolve) => setTimeout(resolve, 2000));
-        fileInfo = await client.files.get({ name: uploadResult.name });
-        attempts++;
-      }
+      if (uploadResult.name) {
+        let fileInfo = await client.files.get({ name: uploadResult.name });
+        let attempts = 0;
+        while (fileInfo.state === "PROCESSING" && attempts < 30) {
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+          fileInfo = await client.files.get({ name: uploadResult.name });
+          attempts++;
+        }
 
-      if (fileInfo.state !== "ACTIVE") {
-        throw new Error(`Uploaded file failed to activate (state: ${fileInfo.state})`);
+        if (fileInfo.state !== "ACTIVE") {
+          throw new Error(`Uploaded file failed to activate (state: ${fileInfo.state})`);
+        }
       }
     }
 
@@ -790,7 +792,9 @@ export async function adaptContent(
   scriptContent: string,
   platforms: Platform[]
 ): Promise<PlatformAdaptation[]> {
-  const targetPlatforms = Array.isArray(platforms) && platforms.length > 0 ? platforms : ["youtube_shorts"];
+  const targetPlatforms: Platform[] = Array.isArray(platforms) && platforms.length > 0
+    ? platforms
+    : (["youtube_shorts"] as Platform[]);
   const trimmedInput = (scriptContent ?? "").trim();
 
   if (!trimmedInput) {
@@ -881,8 +885,9 @@ export async function adaptContent(
     const fallbackList = getFallbackAdaptations(trimmedInput, targetPlatforms);
 
     for (const platform of targetPlatforms) {
-      if (resultMap.has(platform)) {
-        finalAdaptations.push(resultMap.get(platform)!);
+      const match = resultMap.get(platform);
+      if (match) {
+        finalAdaptations.push(match);
       } else {
         const fb = fallbackList.find((f) => f.platform === platform) ?? fallbackList[0];
         finalAdaptations.push(fb);
@@ -1206,7 +1211,7 @@ export async function runCreatorPipeline(input: PipelineInput): Promise<Pipeline
   const script = input?.script ?? "";
   const targetPlatforms: Platform[] = input?.platforms && input.platforms.length > 0
     ? input.platforms
-    : ["youtube_shorts", "instagram_reels", "tiktok"];
+    : (["youtube_shorts", "instagram_reels", "tiktok"] as Platform[]);
 
   let transcript = input?.transcript ?? "";
   let scenes: VideoScene[] | undefined = undefined;
