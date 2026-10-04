@@ -29,20 +29,12 @@ CreatorAi is an AI-powered creator operating platform automating script → foot
 - **TypeScript & Docs**: Strict typing, no `any`, small private helpers, and full JSDoc comments on exported functions.
 
 ## Public API (`src/lib/ai/services.ts`)
-```typescript
-export type ClipSuggestion = {
-  startTime: string;   // "HH:MM:SS" or "MM:SS"
-  endTime: string;
-  startSeconds: number;
-  endSeconds: number;
-  title: string;
-  reason: string;
-  confidence: number;  // 0..1
-};
-
-export async function generateHooks(scriptContent: string): Promise<string[]>;
-export async function suggestClips(scriptContent: string, videoTranscript: string): Promise<ClipSuggestion[]>;
-```
+- `generateHooks(scriptContent: string): Promise<string[]>` - Generates exactly 3 distinct scroll-stopping hooks.
+- `suggestClips(scriptContent: string, videoTranscript: string): Promise<ClipSuggestion[]>` - Suggests 3-5 transcript-matched clips sorted by confidence.
+- `adaptContent(scriptContent: string, platforms: Platform[]): Promise<PlatformAdaptation[]>` - Adapts scripts for YouTube Shorts, Reels, TikTok, X, and LinkedIn.
+- `matchScriptToFootage(scriptContent: string, videoTranscript: string): Promise<ScriptFootageMatch[]>` - Matches script beats to timeline footage.
+- `buildEditDecisionList(clips: ClipSuggestion[], opts?: { hook?: string; platform?: Platform }): EditDecisionList` - Pure function generating editable EDL timelines.
+- `generateCreatorInsights(stats: ContentStat[]): Promise<CreatorInsights>` - Computes creator engagement metrics and actionable recommendations.
 
 ## How to Add a New AI Function (5 Steps)
 1. Define strict input/output TypeScript types and response schemas using `Type` from `@google/genai`.

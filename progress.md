@@ -6,10 +6,10 @@
 | :--- | :--- | :--- |
 | `generateHooks` (validation, fallback, schema) | Done | `src/lib/ai/services.ts` |
 | `suggestClips` (validation, fallback, schema) | Done | `src/lib/ai/services.ts` |
-| Platform Adaptation | Todo | `src/lib/ai/` |
-| Creator Insights | Todo | `src/lib/ai/` |
-| Script-to-Footage Matching | Todo | `src/lib/ai/` |
-| Editable Edit-Decision-List (EDL) Output | Todo | `src/lib/ai/` |
+| Platform Adaptation (`adaptContent`) | Done | `src/lib/ai/services.ts` |
+| Creator Insights (`generateCreatorInsights`) | Done | `src/lib/ai/services.ts` |
+| Script-to-Footage Matching (`matchScriptToFootage`) | Done | `src/lib/ai/services.ts` |
+| Editable Edit-Decision-List Output (`buildEditDecisionList`) | Done | `src/lib/ai/services.ts` |
 
 ## Environment Variables
 
@@ -25,4 +25,5 @@
 
 ## Changelog
 
-- **2026-10-04**: Added `generateHooks` and `suggestClips` with defensive validation, 20s timeouts, safe JSON parsing, and graceful heuristic fallbacks in `src/lib/ai/services.ts`.
+- **2026-10-04**: Added `adaptContent`, `matchScriptToFootage`, `buildEditDecisionList`, and `generateCreatorInsights` with refactored shared utilities (`src/lib/ai/utils.ts`, `src/lib/ai/types.ts`) and smoke tests (`scripts/ai-smoke.ts`).
+- **2026-10-04**: Added initial `generateHooks` and `suggestClips` implementation with defensive schemas and offline fallbacks.
