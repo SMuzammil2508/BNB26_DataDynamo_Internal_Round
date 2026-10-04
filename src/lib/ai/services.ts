@@ -432,23 +432,23 @@ export async function analyzeVideo(input: VideoAnalysisInput): Promise<VideoAnal
 
   try {
     let targetUri = fileUri;
-    let targetMimeType = mimeType || "video/mp4";
+    const targetMimeType = mimeType || "video/mp4";
 
     // Handle local file upload
     if (!targetUri && filePath) {
       const uploadResult = await client.files.upload({
         file: filePath,
-        mimeType: targetMimeType,
+        config: { mimeType: targetMimeType },
       });
       uploadedFileName = uploadResult.name;
       targetUri = uploadResult.uri;
 
       // Poll until file state is ACTIVE
-      let fileInfo = await client.files.get({ name: uploadResult.name });
+      let fileInfo = await client.files.get({ name: uploadResult.name! });
       let attempts = 0;
       while (fileInfo.state === "PROCESSING" && attempts < 30) {
         await new Promise((resolve) => setTimeout(resolve, 2000));
-        fileInfo = await client.files.get({ name: uploadResult.name });
+        fileInfo = await client.files.get({ name: uploadResult.name! });
         attempts++;
       }
 
@@ -790,7 +790,7 @@ export async function adaptContent(
   scriptContent: string,
   platforms: Platform[]
 ): Promise<PlatformAdaptation[]> {
-  const targetPlatforms = Array.isArray(platforms) && platforms.length > 0 ? platforms : ["youtube_shorts"];
+  const targetPlatforms: Platform[] = Array.isArray(platforms) && platforms.length > 0 ? platforms : ["youtube_shorts"];
   const trimmedInput = (scriptContent ?? "").trim();
 
   if (!trimmedInput) {
