@@ -70,12 +70,12 @@ async function main() {
   const pipelineLatency = ((t3 - t2) / 1000).toFixed(2);
   console.log(`runCreatorPipeline Latency: ${pipelineLatency}s`);
 
-  console.log("\n--- Per-Step Execution Source ---");
-  console.log(`  Video Analysis: ${pipelineResult.source.videoAnalysis ?? "N/A"}`);
-  console.log(`  Generate Hooks: ${pipelineResult.source.generateHooks}`);
-  console.log(`  Suggest Clips:  ${pipelineResult.source.suggestClips}`);
-  console.log(`  Match Footage:  ${pipelineResult.source.matchScriptToFootage}`);
-  console.log(`  Adapt Content:  ${pipelineResult.source.adaptContent}`);
+  console.log("\n--- Per-Step Execution Source & Provider ---");
+  console.log(`  Video Analysis: ${pipelineResult.source.videoAnalysis ?? "N/A"} (${pipelineResult.provider.videoAnalysis ?? "N/A"})`);
+  console.log(`  Generate Hooks: ${pipelineResult.source.generateHooks} (${pipelineResult.provider.generateHooks})`);
+  console.log(`  Suggest Clips:  ${pipelineResult.source.suggestClips} (${pipelineResult.provider.suggestClips})`);
+  console.log(`  Match Footage:  ${pipelineResult.source.matchScriptToFootage} (${pipelineResult.provider.matchScriptToFootage})`);
+  console.log(`  Adapt Content:  ${pipelineResult.source.adaptContent} (${pipelineResult.provider.adaptContent})`);
 
   console.log("\nSuggested Clips:");
   if (pipelineResult.clips.length === 0) {

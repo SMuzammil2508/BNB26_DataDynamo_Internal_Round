@@ -134,8 +134,29 @@ export type PipelineResult = {
     matchScriptToFootage: "live" | "fallback";
     adaptContent: "live" | "fallback";
   };
+  provider: {
+    videoAnalysis?: "gemini" | "groq" | "fallback";
+    generateHooks: "gemini" | "groq" | "fallback";
+    suggestClips: "gemini" | "groq" | "fallback";
+    matchScriptToFootage: "gemini" | "groq" | "fallback";
+    adaptContent: "gemini" | "groq" | "fallback";
+  };
 };
 ```
+
+---
+
+## Environment Variables & Model Chain
+
+- `GEMINI_API_KEY`: Primary API key for Gemini models.
+- `GEMINI_MODEL`: Primary text/multimodal model (default `gemini-2.5-flash`).
+- `GEMINI_FALLBACK_MODELS`: Comma-separated fallback models (default `gemini-2.5-flash-lite`).
+- `GROQ_API_KEY`: API key for Groq fallback provider (optional, skipped if unset).
+- `GROQ_MODEL`: Model identifier for Groq fetch completions (default `llama-3.3-70b-versatile`).
+- `AI_DISK_CACHE`: Toggle persistent 24h disk caching in `.cache/ai/` (`0` disables disk cache, default enabled).
+
+**Provider Chain for Text Generation:**
+`GEMINI_MODEL` ➔ `GEMINI_FALLBACK_MODELS` ➔ `Groq` ➔ `Local Heuristic Fallback`.
 
 ---
 

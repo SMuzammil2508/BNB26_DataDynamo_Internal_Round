@@ -50,3 +50,7 @@ dev.db-journal
 sample.mp4
 *.mp4
 
+# persistent cache
+.cache/
+
+

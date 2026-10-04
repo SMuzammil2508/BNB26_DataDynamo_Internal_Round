@@ -24,20 +24,23 @@ CreatorAi is an AI-powered creator operating platform automating script → foot
 ## Conventions
 - **Lazy Initialization**: Never initialize clients at top-level module scope; instantiate lazily to avoid runtime import failures when API keys are absent.
 - **Graceful Fallbacks**: Never throw on missing keys, API timeouts (~20s / 120s for video), or unparseable responses; log a warning (`[CreatorAI] ...`) and return typed dummy/heuristic data.
-- **In-Memory Caching**: AI calls are cached in memory (10-minute TTL) by SHA-256 hash of inputs.
+- **In-Memory & Persistent Caching**: AI calls are cached in memory (10-minute TTL) and persisted to `.cache/ai/` (24-hour TTL) by SHA-256 hash of inputs. Disabled via `AI_DISK_CACHE=0`. Never cache fallback responses.
+- **Model Chain & Quota-Aware Cascades**: Text generation cascades through `GEMINI_MODEL` -> `GEMINI_FALLBACK_MODELS` -> `Groq` (`llama-3.3-70b-versatile` via native fetch) -> local heuristic fallbacks. On 429 daily quota exhaustion (`PerDay` or retryDelay > 60s), cascade immediately without retrying the same model.
+- **Concise Error Extraction**: Extract status and short summaries (`formatShortError`) rather than logging raw JSON error payloads.
 - **Defensive Parsing**: Use `config.responseSchema` with `responseMimeType: "application/json"`, and defensively parse JSON while stripping markdown code fences.
 - **Input Boundaries**: Guard against empty inputs and truncate large inputs (>30,000 chars).
 - **TypeScript & Docs**: Strict typing, no `any`, small private helpers, and full JSDoc comments on exported functions.
 
 ## Public API (`src/lib/ai/services.ts`)
-- `generateHooks(scriptContent: string): Promise<string[]>` - Generates exactly 3 distinct scroll-stopping hooks.
+- `generateHooks(scriptContent: string): Promise<HookOption[]>` - Generates exactly 3 distinct structured hooks.
 - `suggestClips(scriptContent: string, videoTranscript: string): Promise<ClipSuggestion[]>` - Suggests 3-5 transcript-matched clips sorted by confidence.
 - `adaptContent(scriptContent: string, platforms: Platform[]): Promise<PlatformAdaptation[]>` - Adapts scripts for YouTube Shorts, Reels, TikTok, X, and LinkedIn.
+- `adaptContent(script: string, platform: 'TIKTOK' | 'REELS' | 'YOUTUBE'): Promise<SinglePlatformAdaptation>` - Platform-specific title, description, and hashtags.
 - `matchScriptToFootage(scriptContent: string, videoTranscript: string): Promise<ScriptFootageMatch[]>` - Matches script beats to timeline footage.
 - `buildEditDecisionList(clips: ClipSuggestion[], opts?: { hook?: string; platform?: Platform }): EditDecisionList` - Pure function generating editable EDL timelines.
 - `generateCreatorInsights(stats: ContentStat[]): Promise<CreatorInsights>` - Computes creator engagement metrics and actionable recommendations.
-- `analyzeVideo(input: VideoAnalysisInput): Promise<VideoAnalysis>` - Multimodal video transcription and scene analysis.
-- `runCreatorPipeline(input: PipelineInput): Promise<PipelineResult>` - End-to-end orchestration pipeline with warnings and fallback collection.
+- `analyzeVideo(input: VideoAnalysisInput): Promise<VideoAnalysis>` - Multimodal video transcription and scene analysis (Gemini-only).
+- `runCreatorPipeline(input: PipelineInput): Promise<PipelineResult>` - End-to-end orchestration pipeline with warnings, source tracking, and provider mapping.
 
 ## How to Add a New AI Function (5 Steps)
 1. Define strict input/output TypeScript types and response schemas using `Type` from `@google/genai`.

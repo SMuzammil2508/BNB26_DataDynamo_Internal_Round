@@ -113,6 +113,7 @@ export type PipelineInput = {
 };
 
 export type ExecutionSource = "live" | "fallback";
+export type ExecutionProvider = "gemini" | "groq" | "fallback";
 
 export type PipelineSources = {
   videoAnalysis?: ExecutionSource;
@@ -120,6 +121,14 @@ export type PipelineSources = {
   suggestClips: ExecutionSource;
   matchScriptToFootage: ExecutionSource;
   adaptContent: ExecutionSource;
+};
+
+export type PipelineProviders = {
+  videoAnalysis?: ExecutionProvider;
+  generateHooks: ExecutionProvider;
+  suggestClips: ExecutionProvider;
+  matchScriptToFootage: ExecutionProvider;
+  adaptContent: ExecutionProvider;
 };
 
 export type PipelineResult = {
@@ -132,4 +141,5 @@ export type PipelineResult = {
   scenes?: VideoScene[];
   warnings: string[];
   source: PipelineSources;
+  provider: PipelineProviders;
 };

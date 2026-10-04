@@ -16,18 +16,22 @@ import type {
   PipelineInput,
   PipelineResult,
   ExecutionSource,
+  ExecutionProvider,
+  PipelineProviders,
 } from "./types";
 import {
   getGenAIClient,
   timeToSeconds,
   safeJsonParse,
   withTimeout,
-  executeWithRetry,
+  executeTextModelChain,
   getFirstSentence,
   normalizeTranscript,
   generateCacheKey,
+  generateVideoCacheKey,
   getCachedValue,
   setCachedValue,
+  formatShortError,
   MAX_INPUT_CHARS,
   VIDEO_API_TIMEOUT_MS,
 } from "./utils";
@@ -496,6 +500,7 @@ function getFallbackVideoAnalysis(): VideoAnalysis {
 type ExecutionWithStatus<T> = {
   data: T;
   source: ExecutionSource;
+  provider: ExecutionProvider;
   warning?: string;
 };
 
@@ -518,13 +523,22 @@ async function internalAnalyzeVideo(input: VideoAnalysisInput): Promise<Executio
   const { fileUri, filePath, mimeType } = input || {};
   if (!fileUri && !filePath) {
     console.warn("[CreatorAI] analyzeVideo: No fileUri or filePath provided. Returning fallback video analysis.");
-    return { data: getFallbackVideoAnalysis(), source: "fallback", warning: "No fileUri or filePath provided for analyzeVideo" };
+    return { data: getFallbackVideoAnalysis(), source: "fallback", provider: "fallback", warning: "No fileUri or filePath provided for analyzeVideo" };
+  }
+
+  // Check persistent disk cache for video files
+  const videoCacheKey = filePath ? generateVideoCacheKey(filePath) : fileUri ? generateCacheKey("analyzeVideo_v1", fileUri) : null;
+  if (videoCacheKey) {
+    const cached = getCachedValue<VideoAnalysis>(videoCacheKey);
+    if (cached) {
+      return { data: cached.value, source: "live", provider: cached.provider };
+    }
   }
 
   const { client, model } = getGenAIClient();
   if (!client) {
     console.warn("[CreatorAI] analyzeVideo: GEMINI_API_KEY / GOOGLE_API_KEY is not set. Returning fallback video analysis.");
-    return { data: getFallbackVideoAnalysis(), source: "fallback", warning: "API key is not configured for analyzeVideo" };
+    return { data: getFallbackVideoAnalysis(), source: "fallback", provider: "fallback", warning: "API key is not configured for analyzeVideo" };
   }
 
   let uploadedFileName: string | undefined;
@@ -612,7 +626,7 @@ async function internalAnalyzeVideo(input: VideoAnalysisInput): Promise<Executio
 
     if (!parsed || typeof parsed.transcript !== "string") {
       console.warn("[CreatorAI] analyzeVideo: Failed to parse valid video analysis JSON from model response.");
-      return { data: getFallbackVideoAnalysis(), source: "fallback", warning: "Failed to parse valid video analysis from model" };
+      return { data: getFallbackVideoAnalysis(), source: "fallback", provider: "fallback", warning: "Failed to parse valid video analysis from model" };
     }
 
     const scenes: VideoScene[] = [];
@@ -642,19 +656,25 @@ async function internalAnalyzeVideo(input: VideoAnalysisInput): Promise<Executio
     }
 
     const normalizedTranscript = normalizeTranscript(parsed.transcript.trim());
+    const resultData: VideoAnalysis = {
+      transcript: normalizedTranscript,
+      scenes,
+      durationSeconds: parsed.durationSeconds || (scenes[scenes.length - 1]?.endSeconds ?? 0),
+    };
+
+    if (videoCacheKey) {
+      setCachedValue(videoCacheKey, resultData, "gemini");
+    }
 
     return {
-      data: {
-        transcript: normalizedTranscript,
-        scenes,
-        durationSeconds: parsed.durationSeconds || (scenes[scenes.length - 1]?.endSeconds ?? 0),
-      },
+      data: resultData,
       source: "live",
+      provider: "gemini",
     };
   } catch (error) {
-    const errorMsg = error instanceof Error ? error.message : "Unknown error";
+    const errorMsg = formatShortError(model, error);
     console.warn(`[CreatorAI] analyzeVideo: Video analysis failed (${errorMsg}). Returning fallback.`);
-    return { data: getFallbackVideoAnalysis(), source: "fallback", warning: `analyzeVideo failed: ${errorMsg}` };
+    return { data: getFallbackVideoAnalysis(), source: "fallback", provider: "fallback", warning: `analyzeVideo failed: ${errorMsg}` };
   } finally {
     if (uploadedFileName && client) {
       try {
@@ -681,18 +701,12 @@ async function internalGenerateHooks(scriptContent: string): Promise<ExecutionWi
   const trimmedInput = (scriptContent ?? "").trim();
   if (!trimmedInput) {
     console.warn("[CreatorAI] generateHooks: Empty or whitespace input provided. Returning fallback hooks.");
-    return { data: getFallbackHooks(""), source: "fallback", warning: "Empty input provided to generateHooks" };
+    return { data: getFallbackHooks(""), source: "fallback", provider: "fallback", warning: "Empty input provided to generateHooks" };
   }
 
   const cacheKey = generateCacheKey("generateHooks_v3", trimmedInput);
   const cached = getCachedValue<HookOption[]>(cacheKey);
-  if (cached) return { data: cached, source: "live" };
-
-  const { client } = getGenAIClient();
-  if (!client) {
-    console.warn("[CreatorAI] generateHooks: GEMINI_API_KEY / GOOGLE_API_KEY is not set. Returning fallback hooks.");
-    return { data: getFallbackHooks(trimmedInput), source: "fallback", warning: "API key is not configured for generateHooks" };
-  }
+  if (cached) return { data: cached.value, source: "live", provider: cached.provider };
 
   const boundedInput = trimmedInput.slice(0, MAX_INPUT_CHARS);
   const systemInstruction =
@@ -707,9 +721,11 @@ async function internalGenerateHooks(scriptContent: string): Promise<ExecutionWi
   const prompt = `Script Content:\n"""\n${boundedInput}\n"""\n\nGenerate 3 distinct structured hooks.`;
 
   try {
-    const response = await executeWithRetry(
+    const execResult = await executeTextModelChain<HookOption[]>(
       async (modelName) => {
-        return await client.models.generateContent({
+        const { client } = getGenAIClient();
+        if (!client) throw new Error("GEMINI_API_KEY not configured");
+        const res = await client.models.generateContent({
           model: modelName,
           contents: prompt,
           config: {
@@ -719,60 +735,61 @@ async function internalGenerateHooks(scriptContent: string): Promise<ExecutionWi
             thinkingConfig: { thinkingBudget: 0 },
           },
         });
+        return res.text ?? "";
       },
+      (rawText) => {
+        const parsed = safeJsonParse<{
+          hooks?: Array<{
+            hookText?: string;
+            viralScore?: number;
+            emotionalType?: string;
+          }>;
+        }>(rawText);
+
+        if (!parsed || !Array.isArray(parsed.hooks)) return null;
+
+        const cleanedHooks: HookOption[] = [];
+        for (const h of parsed.hooks) {
+          if (!h || typeof h !== "object") continue;
+          const hookText = typeof h.hookText === "string" ? h.hookText.trim() : "";
+          if (!hookText) continue;
+
+          const rawScore = typeof h.viralScore === "number" ? Math.round(h.viralScore) : 85;
+          const viralScore = Math.max(0, Math.min(100, rawScore));
+          const emotionalType = typeof h.emotionalType === "string" && h.emotionalType.trim()
+            ? h.emotionalType.trim()
+            : "Curiosity";
+
+          cleanedHooks.push({
+            hookText: hookText.length > 140 ? `${hookText.slice(0, 137)}...` : hookText,
+            viralScore,
+            emotionalType,
+          });
+        }
+
+        if (cleanedHooks.length < 3) {
+          const fallbackList = getFallbackHooks(trimmedInput);
+          for (const fallback of fallbackList) {
+            if (cleanedHooks.length >= 3) break;
+            if (!cleanedHooks.some((item) => item.hookText === fallback.hookText)) {
+              cleanedHooks.push(fallback);
+            }
+          }
+        }
+
+        return cleanedHooks.slice(0, 3);
+      },
+      systemInstruction,
+      prompt,
       "generateHooks"
     );
 
-    const rawText = response.text ?? "";
-    const parsed = safeJsonParse<{
-      hooks?: Array<{
-        hookText?: string;
-        viralScore?: number;
-        emotionalType?: string;
-      }>;
-    }>(rawText);
-
-    if (!parsed || !Array.isArray(parsed.hooks)) {
-      console.warn("[CreatorAI] generateHooks: Failed to parse valid hooks JSON from model response. Returning fallback.");
-      return { data: getFallbackHooks(trimmedInput), source: "fallback", warning: "generateHooks returned unparseable JSON" };
-    }
-
-    const cleanedHooks: HookOption[] = [];
-    for (const h of parsed.hooks) {
-      if (!h || typeof h !== "object") continue;
-      const hookText = typeof h.hookText === "string" ? h.hookText.trim() : "";
-      if (!hookText) continue;
-
-      const rawScore = typeof h.viralScore === "number" ? Math.round(h.viralScore) : 85;
-      const viralScore = Math.max(0, Math.min(100, rawScore));
-      const emotionalType = typeof h.emotionalType === "string" && h.emotionalType.trim()
-        ? h.emotionalType.trim()
-        : "Curiosity";
-
-      cleanedHooks.push({
-        hookText: hookText.length > 140 ? `${hookText.slice(0, 137)}...` : hookText,
-        viralScore,
-        emotionalType,
-      });
-    }
-
-    if (cleanedHooks.length < 3) {
-      const fallbackList = getFallbackHooks(trimmedInput);
-      for (const fallback of fallbackList) {
-        if (cleanedHooks.length >= 3) break;
-        if (!cleanedHooks.some((item) => item.hookText === fallback.hookText)) {
-          cleanedHooks.push(fallback);
-        }
-      }
-    }
-
-    const result = cleanedHooks.slice(0, 3);
-    setCachedValue(cacheKey, result);
-    return { data: result, source: "live" };
+    setCachedValue(cacheKey, execResult.data, execResult.provider);
+    return { data: execResult.data, source: "live", provider: execResult.provider };
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : "Unknown error";
-    console.warn(`[CreatorAI] generateHooks: API call failed or timed out (${errorMsg}). Returning fallback.`);
-    return { data: getFallbackHooks(trimmedInput), source: "fallback", warning: `generateHooks failed: ${errorMsg}` };
+    console.warn(`[CreatorAI] generateHooks: All providers failed (${errorMsg}). Returning fallback.`);
+    return { data: getFallbackHooks(trimmedInput), source: "fallback", provider: "fallback", warning: `generateHooks failed: ${errorMsg}` };
   }
 }
 
@@ -800,18 +817,12 @@ async function internalSuggestClips(
 
   if (!trimmedScript && !normalizedTranscript) {
     console.warn("[CreatorAI] suggestClips: Empty script and transcript provided. Returning fallback clips.");
-    return { data: getFallbackClips("", ""), source: "fallback", warning: "Empty input to suggestClips" };
+    return { data: getFallbackClips("", ""), source: "fallback", provider: "fallback", warning: "Empty input to suggestClips" };
   }
 
   const cacheKey = generateCacheKey("suggestClips_v3", { trimmedScript, normalizedTranscript });
   const cached = getCachedValue<ClipSuggestion[]>(cacheKey);
-  if (cached) return { data: cached, source: "live" };
-
-  const { client } = getGenAIClient();
-  if (!client) {
-    console.warn("[CreatorAI] suggestClips: GEMINI_API_KEY / GOOGLE_API_KEY is not set. Returning fallback clips.");
-    return { data: getFallbackClips(trimmedScript, normalizedTranscript), source: "fallback", warning: "API key is not configured for suggestClips" };
-  }
+  if (cached) return { data: cached.value, source: "live", provider: cached.provider };
 
   const boundedScript = trimmedScript.slice(0, MAX_INPUT_CHARS);
   const boundedTranscript = normalizedTranscript.slice(0, MAX_INPUT_CHARS);
@@ -831,9 +842,11 @@ async function internalSuggestClips(
     "Identify 3-5 optimal short-form clips according to the instructions.";
 
   try {
-    const response = await executeWithRetry(
+    const execResult = await executeTextModelChain<ClipSuggestion[]>(
       async (modelName) => {
-        return await client.models.generateContent({
+        const { client } = getGenAIClient();
+        if (!client) throw new Error("GEMINI_API_KEY not configured");
+        const res = await client.models.generateContent({
           model: modelName,
           contents: prompt,
           config: {
@@ -843,72 +856,69 @@ async function internalSuggestClips(
             thinkingConfig: { thinkingBudget: 0 },
           },
         });
+        return res.text ?? "";
       },
+      (rawText) => {
+        const parsed = safeJsonParse<{
+          clips?: Array<{
+            startTime?: string;
+            endTime?: string;
+            title?: string;
+            reason?: string;
+            confidence?: number;
+          }>;
+        }>(rawText);
+
+        if (!parsed || !Array.isArray(parsed.clips)) return null;
+
+        const validatedClips: ClipSuggestion[] = [];
+        for (const item of parsed.clips) {
+          if (!item || typeof item !== "object") continue;
+
+          const startTime = typeof item.startTime === "string" ? item.startTime.trim() : "";
+          const endTime = typeof item.endTime === "string" ? item.endTime.trim() : "";
+          const title = typeof item.title === "string" && item.title.trim() ? item.title.trim() : "Untitled Clip";
+          const reason = typeof item.reason === "string" && item.reason.trim() ? item.reason.trim() : "Highlight segment.";
+
+          const startSeconds = timeToSeconds(startTime);
+          const endSeconds = timeToSeconds(endTime);
+
+          if (Number.isNaN(startSeconds) || Number.isNaN(endSeconds)) continue;
+          if (endSeconds <= startSeconds) continue;
+
+          const duration = endSeconds - startSeconds;
+          if (duration < 5 || duration > 90) continue;
+
+          const rawConfidence = typeof item.confidence === "number" ? item.confidence : 0.7;
+          const confidence = Math.max(0, Math.min(1, Number(rawConfidence.toFixed(2))));
+
+          validatedClips.push({
+            startTime,
+            endTime,
+            startSeconds,
+            endSeconds,
+            title,
+            reason,
+            confidence,
+          });
+        }
+
+        if (validatedClips.length === 0) return null;
+
+        validatedClips.sort((a, b) => b.confidence - a.confidence);
+        return validatedClips.slice(0, 5);
+      },
+      systemInstruction,
+      prompt,
       "suggestClips"
     );
 
-    const rawText = response.text ?? "";
-    const parsed = safeJsonParse<{
-      clips?: Array<{
-        startTime?: string;
-        endTime?: string;
-        title?: string;
-        reason?: string;
-        confidence?: number;
-      }>;
-    }>(rawText);
-
-    if (!parsed || !Array.isArray(parsed.clips)) {
-      console.warn("[CreatorAI] suggestClips: Failed to parse valid clips JSON from model response. Returning fallback.");
-      return { data: getFallbackClips(trimmedScript, normalizedTranscript), source: "fallback", warning: "suggestClips returned unparseable JSON" };
-    }
-
-    const validatedClips: ClipSuggestion[] = [];
-
-    for (const item of parsed.clips) {
-      if (!item || typeof item !== "object") continue;
-
-      const startTime = typeof item.startTime === "string" ? item.startTime.trim() : "";
-      const endTime = typeof item.endTime === "string" ? item.endTime.trim() : "";
-      const title = typeof item.title === "string" && item.title.trim() ? item.title.trim() : "Untitled Clip";
-      const reason = typeof item.reason === "string" && item.reason.trim() ? item.reason.trim() : "Highlight segment.";
-
-      const startSeconds = timeToSeconds(startTime);
-      const endSeconds = timeToSeconds(endTime);
-
-      if (Number.isNaN(startSeconds) || Number.isNaN(endSeconds)) continue;
-      if (endSeconds <= startSeconds) continue;
-
-      const duration = endSeconds - startSeconds;
-      if (duration < 5 || duration > 90) continue;
-
-      const rawConfidence = typeof item.confidence === "number" ? item.confidence : 0.7;
-      const confidence = Math.max(0, Math.min(1, Number(rawConfidence.toFixed(2))));
-
-      validatedClips.push({
-        startTime,
-        endTime,
-        startSeconds,
-        endSeconds,
-        title,
-        reason,
-        confidence,
-      });
-    }
-
-    if (validatedClips.length === 0) {
-      console.warn("[CreatorAI] suggestClips: No valid clips passed timestamp/duration validation. Returning fallback.");
-      return { data: getFallbackClips(trimmedScript, normalizedTranscript), source: "fallback", warning: "No suggested clips passed duration/timestamp validation" };
-    }
-
-    validatedClips.sort((a, b) => b.confidence - a.confidence);
-    const result = validatedClips.slice(0, 5);
-    setCachedValue(cacheKey, result);
-    return { data: result, source: "live" };
+    setCachedValue(cacheKey, execResult.data, execResult.provider);
+    return { data: execResult.data, source: "live", provider: execResult.provider };
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : "Unknown error";
-    console.warn(`[CreatorAI] suggestClips: API call failed or timed out (${errorMsg}). Returning fallback.`);
-    return { data: getFallbackClips(trimmedScript, normalizedTranscript), source: "fallback", warning: `suggestClips failed: ${errorMsg}` };
+    console.warn(`[CreatorAI] suggestClips: All providers failed (${errorMsg}). Returning fallback.`);
+    return { data: getFallbackClips(trimmedScript, normalizedTranscript), source: "fallback", provider: "fallback", warning: `suggestClips failed: ${errorMsg}` };
   }
 }
 
@@ -944,18 +954,12 @@ async function internalAdaptContent(
     const singlePlatform = platformOrPlatforms.toUpperCase() as UppercasePlatform;
     if (!trimmedInput) {
       console.warn(`[CreatorAI] adaptContent: Empty script provided for ${singlePlatform}. Returning fallback.`);
-      return { data: getFallbackSingleAdaptation("", singlePlatform), source: "fallback", warning: `Empty script provided for ${singlePlatform}` };
+      return { data: getFallbackSingleAdaptation("", singlePlatform), source: "fallback", provider: "fallback", warning: `Empty script provided for ${singlePlatform}` };
     }
 
     const cacheKey = generateCacheKey("adaptContent_single_v3", { trimmedInput, singlePlatform });
     const cached = getCachedValue<SinglePlatformAdaptation>(cacheKey);
-    if (cached) return { data: cached, source: "live" };
-
-    const { client } = getGenAIClient();
-    if (!client) {
-      console.warn(`[CreatorAI] adaptContent: API key not set. Returning fallback for ${singlePlatform}.`);
-      return { data: getFallbackSingleAdaptation(trimmedInput, singlePlatform), source: "fallback", warning: "API key not configured for adaptContent" };
-    }
+    if (cached) return { data: cached.value, source: "live", provider: cached.provider };
 
     const boundedInput = trimmedInput.slice(0, MAX_INPUT_CHARS);
     const systemInstruction =
@@ -966,9 +970,11 @@ async function internalAdaptContent(
     const prompt = `Script Content:\n"""\n${boundedInput}\n"""\n\nGenerate optimized title, description, and hashtags for ${singlePlatform}.`;
 
     try {
-      const response = await executeWithRetry(
+      const execResult = await executeTextModelChain<SinglePlatformAdaptation>(
         async (modelName) => {
-          return await client.models.generateContent({
+          const { client } = getGenAIClient();
+          if (!client) throw new Error("GEMINI_API_KEY not configured");
+          const res = await client.models.generateContent({
             model: modelName,
             contents: prompt,
             config: {
@@ -978,35 +984,35 @@ async function internalAdaptContent(
               thinkingConfig: { thinkingBudget: 0 },
             },
           });
+          return res.text ?? "";
         },
+        (rawText) => {
+          const parsed = safeJsonParse<SinglePlatformAdaptation>(rawText);
+          if (!parsed || !parsed.title || !parsed.description) return null;
+
+          const hashtags = Array.isArray(parsed.hashtags)
+            ? parsed.hashtags
+                .filter((h): h is string => typeof h === "string" && h.trim().length > 0)
+                .map((h) => (h.startsWith("#") ? h.trim() : `#${h.trim()}`))
+            : ["#viral", "#content", "#growth"];
+
+          return {
+            title: parsed.title.trim(),
+            description: parsed.description.trim(),
+            hashtags: hashtags.length > 0 ? hashtags : ["#viral", "#content"],
+          };
+        },
+        systemInstruction,
+        prompt,
         `adaptContent_${singlePlatform}`
       );
 
-      const rawText = response.text ?? "";
-      const parsed = safeJsonParse<SinglePlatformAdaptation>(rawText);
-
-      if (!parsed || !parsed.title || !parsed.description) {
-        return { data: getFallbackSingleAdaptation(trimmedInput, singlePlatform), source: "fallback", warning: `Unparseable response for ${singlePlatform}` };
-      }
-
-      const hashtags = Array.isArray(parsed.hashtags)
-        ? parsed.hashtags
-            .filter((h): h is string => typeof h === "string" && h.trim().length > 0)
-            .map((h) => (h.startsWith("#") ? h.trim() : `#${h.trim()}`))
-        : ["#viral", "#content", "#growth"];
-
-      const result: SinglePlatformAdaptation = {
-        title: parsed.title.trim(),
-        description: parsed.description.trim(),
-        hashtags: hashtags.length > 0 ? hashtags : ["#viral", "#content"],
-      };
-
-      setCachedValue(cacheKey, result);
-      return { data: result, source: "live" };
+      setCachedValue(cacheKey, execResult.data, execResult.provider);
+      return { data: execResult.data, source: "live", provider: execResult.provider };
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : "Unknown error";
-      console.warn(`[CreatorAI] adaptContent: API call failed for ${singlePlatform} (${errorMsg}). Returning fallback.`);
-      return { data: getFallbackSingleAdaptation(trimmedInput, singlePlatform), source: "fallback", warning: `adaptContent (${singlePlatform}) failed: ${errorMsg}` };
+      console.warn(`[CreatorAI] adaptContent: All providers failed for ${singlePlatform} (${errorMsg}). Returning fallback.`);
+      return { data: getFallbackSingleAdaptation(trimmedInput, singlePlatform), source: "fallback", provider: "fallback", warning: `adaptContent (${singlePlatform}) failed: ${errorMsg}` };
     }
   }
 
@@ -1017,18 +1023,12 @@ async function internalAdaptContent(
 
   if (!trimmedInput) {
     console.warn("[CreatorAI] adaptContent: Empty script input provided. Returning fallback adaptations.");
-    return { data: getFallbackAdaptations("", targetPlatforms), source: "fallback", warning: "Empty script input to adaptContent" };
+    return { data: getFallbackAdaptations("", targetPlatforms), source: "fallback", provider: "fallback", warning: "Empty script input to adaptContent" };
   }
 
   const cacheKey = generateCacheKey("adaptContent_multi_v3", { trimmedInput, targetPlatforms });
   const cached = getCachedValue<PlatformAdaptation[]>(cacheKey);
-  if (cached) return { data: cached, source: "live" };
-
-  const { client } = getGenAIClient();
-  if (!client) {
-    console.warn("[CreatorAI] adaptContent: GEMINI_API_KEY / GOOGLE_API_KEY is not set. Returning fallback adaptations.");
-    return { data: getFallbackAdaptations(trimmedInput, targetPlatforms), source: "fallback", warning: "API key is not configured for adaptContent" };
-  }
+  if (cached) return { data: cached.value, source: "live", provider: cached.provider };
 
   const boundedInput = trimmedInput.slice(0, MAX_INPUT_CHARS);
   const systemInstruction =
@@ -1039,9 +1039,11 @@ async function internalAdaptContent(
   const prompt = `Platforms to adapt for: ${targetPlatforms.join(", ")}\n\nContent:\n"""\n${boundedInput}\n"""`;
 
   try {
-    const response = await executeWithRetry(
+    const execResult = await executeTextModelChain<PlatformAdaptation[]>(
       async (modelName) => {
-        return await client.models.generateContent({
+        const { client } = getGenAIClient();
+        if (!client) throw new Error("GEMINI_API_KEY not configured");
+        const res = await client.models.generateContent({
           model: modelName,
           contents: prompt,
           config: {
@@ -1051,75 +1053,82 @@ async function internalAdaptContent(
             thinkingConfig: { thinkingBudget: 0 },
           },
         });
+        return res.text ?? "";
       },
+      (rawText) => {
+        const parsed = safeJsonParse<{
+          adaptations?: Array<{
+            platform?: string;
+            caption?: string;
+            hashtags?: string[];
+            hook?: string;
+            postingTip?: string;
+          }>;
+        }>(rawText);
+
+        const rawAdaptations = parsed?.adaptations ?? [];
+        if (!Array.isArray(rawAdaptations) || rawAdaptations.length === 0) return null;
+
+        const resultMap = new Map<Platform, PlatformAdaptation>();
+
+        for (const raw of rawAdaptations) {
+          const platformKey = (raw.platform ?? "").toLowerCase() as Platform;
+          if (!targetPlatforms.includes(platformKey)) continue;
+
+          const spec = PLATFORM_SPECS[platformKey] ?? PLATFORM_SPECS.youtube_shorts;
+          const rawCaption = typeof raw.caption === "string" ? raw.caption.trim() : "";
+          const caption = rawCaption.slice(0, spec.maxCaptionChars) || `Content update for ${platformKey}.`;
+
+          const rawHashtags = Array.isArray(raw.hashtags) ? raw.hashtags : [];
+          const hashtags = rawHashtags
+            .filter((h): h is string => typeof h === "string" && h.trim().length > 0)
+            .map((h) => (h.startsWith("#") ? h.trim() : `#${h.trim()}`))
+            .slice(0, spec.maxHashtags);
+
+          const rawHook = typeof raw.hook === "string" ? raw.hook.trim() : "";
+          const hook = (rawHook || getFirstSentence(trimmedInput)).slice(0, 140);
+
+          const postingTip = typeof raw.postingTip === "string" && raw.postingTip.trim()
+            ? raw.postingTip.trim()
+            : spec.defaultTip;
+
+          resultMap.set(platformKey, {
+            platform: platformKey,
+            caption,
+            hashtags: hashtags.length > 0 ? hashtags : ["#CreatorAI"],
+            hook,
+            aspectRatio: spec.aspectRatio,
+            maxDurationSeconds: spec.maxDurationSeconds,
+            postingTip,
+          });
+        }
+
+        const finalAdaptations: PlatformAdaptation[] = [];
+        const fallbackList = getFallbackAdaptations(trimmedInput, targetPlatforms);
+
+        for (const platform of targetPlatforms) {
+          const match = resultMap.get(platform);
+          if (match) {
+            finalAdaptations.push(match);
+          } else {
+            const fb = fallbackList.find((f) => f.platform === platform) ?? fallbackList[0];
+            finalAdaptations.push(fb);
+          }
+        }
+
+        return finalAdaptations;
+      },
+      systemInstruction,
+      prompt,
       "adaptContent_multi"
     );
 
-    const rawText = response.text ?? "";
-    const parsed = safeJsonParse<{
-      adaptations?: Array<{
-        platform?: string;
-        caption?: string;
-        hashtags?: string[];
-        hook?: string;
-        postingTip?: string;
-      }>;
-    }>(rawText);
-
-    const rawAdaptations = parsed?.adaptations ?? [];
-    const resultMap = new Map<Platform, PlatformAdaptation>();
-
-    for (const raw of rawAdaptations) {
-      const platformKey = (raw.platform ?? "").toLowerCase() as Platform;
-      if (!targetPlatforms.includes(platformKey)) continue;
-
-      const spec = PLATFORM_SPECS[platformKey] ?? PLATFORM_SPECS.youtube_shorts;
-      const rawCaption = typeof raw.caption === "string" ? raw.caption.trim() : "";
-      const caption = rawCaption.slice(0, spec.maxCaptionChars) || `Content update for ${platformKey}.`;
-
-      const rawHashtags = Array.isArray(raw.hashtags) ? raw.hashtags : [];
-      const hashtags = rawHashtags
-        .filter((h): h is string => typeof h === "string" && h.trim().length > 0)
-        .map((h) => (h.startsWith("#") ? h.trim() : `#${h.trim()}`))
-        .slice(0, spec.maxHashtags);
-
-      const rawHook = typeof raw.hook === "string" ? raw.hook.trim() : "";
-      const hook = (rawHook || getFirstSentence(trimmedInput)).slice(0, 140);
-
-      const postingTip = typeof raw.postingTip === "string" && raw.postingTip.trim()
-        ? raw.postingTip.trim()
-        : spec.defaultTip;
-
-      resultMap.set(platformKey, {
-        platform: platformKey,
-        caption,
-        hashtags: hashtags.length > 0 ? hashtags : ["#CreatorAI"],
-        hook,
-        aspectRatio: spec.aspectRatio,
-        maxDurationSeconds: spec.maxDurationSeconds,
-        postingTip,
-      });
-    }
-
-    const finalAdaptations: PlatformAdaptation[] = [];
-    const fallbackList = getFallbackAdaptations(trimmedInput, targetPlatforms);
-
-    for (const platform of targetPlatforms) {
-      const match = resultMap.get(platform);
-      if (match) {
-        finalAdaptations.push(match);
-      } else {
-        const fb = fallbackList.find((f) => f.platform === platform) ?? fallbackList[0];
-        finalAdaptations.push(fb);
-      }
-    }
-
-    setCachedValue(cacheKey, finalAdaptations);
-    return { data: finalAdaptations, source: "live" };
+    setCachedValue(cacheKey, execResult.data, execResult.provider);
+    return { data: execResult.data, source: "live", provider: execResult.provider };
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : "Unknown error";
-    console.warn(`[CreatorAI] adaptContent: API call failed (${errorMsg}). Returning fallback.`);
-    return { data: getFallbackAdaptations(trimmedInput, targetPlatforms), source: "fallback", warning: `adaptContent failed: ${errorMsg}` };
+    console.warn(`[CreatorAI] adaptContent: All providers failed (${errorMsg}). Returning fallback.`);
+    return { data: getFallbackAdaptations(trimmedInput, targetPlatforms), source: "fallback", provider: "fallback", warning: `adaptContent failed: ${errorMsg}` };
   }
 }
 
@@ -1147,18 +1156,12 @@ async function internalMatchScriptToFootage(
 
   if (!trimmedScript || !normalizedTranscript) {
     console.warn("[CreatorAI] matchScriptToFootage: Missing script or transcript. Returning fallback matches.");
-    return { data: getFallbackMatches(trimmedScript, normalizedTranscript), source: "fallback", warning: "Missing script or transcript in matchScriptToFootage" };
+    return { data: getFallbackMatches(trimmedScript, normalizedTranscript), source: "fallback", provider: "fallback", warning: "Missing script or transcript in matchScriptToFootage" };
   }
 
   const cacheKey = generateCacheKey("matchScriptToFootage_v3", { trimmedScript, normalizedTranscript });
   const cached = getCachedValue<ScriptFootageMatch[]>(cacheKey);
-  if (cached) return { data: cached, source: "live" };
-
-  const { client } = getGenAIClient();
-  if (!client) {
-    console.warn("[CreatorAI] matchScriptToFootage: GEMINI_API_KEY / GOOGLE_API_KEY is not set. Returning fallback matches.");
-    return { data: getFallbackMatches(trimmedScript, normalizedTranscript), source: "fallback", warning: "API key is not configured for matchScriptToFootage" };
-  }
+  if (cached) return { data: cached.value, source: "live", provider: cached.provider };
 
   // Calculate maximum transcript time for permissive matching
   const timestampRegex = /(?:\[|\b)(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)(?:\]|\b)/g;
@@ -1185,9 +1188,11 @@ async function internalMatchScriptToFootage(
   const prompt = `Script:\n"""\n${boundedScript}\n"""\n\nTranscript:\n"""\n${boundedTranscript}\n"""`;
 
   try {
-    const response = await executeWithRetry(
+    const execResult = await executeTextModelChain<ScriptFootageMatch[]>(
       async (modelName) => {
-        return await client.models.generateContent({
+        const { client } = getGenAIClient();
+        if (!client) throw new Error("GEMINI_API_KEY not configured");
+        const res = await client.models.generateContent({
           model: modelName,
           contents: prompt,
           config: {
@@ -1197,70 +1202,67 @@ async function internalMatchScriptToFootage(
             thinkingConfig: { thinkingBudget: 0 },
           },
         });
+        return res.text ?? "";
       },
+      (rawText) => {
+        const parsed = safeJsonParse<{
+          matches?: Array<{
+            scriptBeat?: string;
+            startTime?: string;
+            endTime?: string;
+            matchScore?: number;
+            note?: string;
+          }>;
+        }>(rawText);
+
+        if (!parsed || !Array.isArray(parsed.matches)) return null;
+
+        const validatedMatches: ScriptFootageMatch[] = [];
+        for (const item of parsed.matches) {
+          if (!item || typeof item !== "object") continue;
+
+          const scriptBeat = typeof item.scriptBeat === "string" && item.scriptBeat.trim()
+            ? item.scriptBeat.trim()
+            : "Script Beat";
+          const startTime = typeof item.startTime === "string" ? item.startTime.trim() : "";
+          const endTime = typeof item.endTime === "string" ? item.endTime.trim() : "";
+          const note = typeof item.note === "string" && item.note.trim() ? item.note.trim() : "Footage match.";
+
+          const startSeconds = timeToSeconds(startTime);
+          const endSeconds = timeToSeconds(endTime);
+
+          if (Number.isNaN(startSeconds) || Number.isNaN(endSeconds)) continue;
+          if (endSeconds <= startSeconds) continue;
+          if (startSeconds > maxAllowedSeconds) continue;
+
+          const rawScore = typeof item.matchScore === "number" ? item.matchScore : 0.8;
+          const matchScore = Math.max(0, Math.min(1, Number(rawScore.toFixed(2))));
+
+          validatedMatches.push({
+            scriptBeat,
+            startTime,
+            endTime,
+            startSeconds,
+            endSeconds,
+            matchScore,
+            note,
+          });
+        }
+
+        if (validatedMatches.length === 0) return null;
+        return validatedMatches;
+      },
+      systemInstruction,
+      prompt,
       "matchScriptToFootage"
     );
 
-    const rawText = response.text ?? "";
-    const parsed = safeJsonParse<{
-      matches?: Array<{
-        scriptBeat?: string;
-        startTime?: string;
-        endTime?: string;
-        matchScore?: number;
-        note?: string;
-      }>;
-    }>(rawText);
-
-    if (!parsed || !Array.isArray(parsed.matches)) {
-      console.warn("[CreatorAI] matchScriptToFootage: Invalid JSON output from model. Returning fallback matches.");
-      return { data: getFallbackMatches(trimmedScript, normalizedTranscript), source: "fallback", warning: "matchScriptToFootage returned unparseable JSON" };
-    }
-
-    const validatedMatches: ScriptFootageMatch[] = [];
-
-    for (const item of parsed.matches) {
-      if (!item || typeof item !== "object") continue;
-
-      const scriptBeat = typeof item.scriptBeat === "string" && item.scriptBeat.trim()
-        ? item.scriptBeat.trim()
-        : "Script Beat";
-      const startTime = typeof item.startTime === "string" ? item.startTime.trim() : "";
-      const endTime = typeof item.endTime === "string" ? item.endTime.trim() : "";
-      const note = typeof item.note === "string" && item.note.trim() ? item.note.trim() : "Footage match.";
-
-      const startSeconds = timeToSeconds(startTime);
-      const endSeconds = timeToSeconds(endTime);
-
-      if (Number.isNaN(startSeconds) || Number.isNaN(endSeconds)) continue;
-      if (endSeconds <= startSeconds) continue;
-      if (startSeconds > maxAllowedSeconds) continue;
-
-      const rawScore = typeof item.matchScore === "number" ? item.matchScore : 0.8;
-      const matchScore = Math.max(0, Math.min(1, Number(rawScore.toFixed(2))));
-
-      validatedMatches.push({
-        scriptBeat,
-        startTime,
-        endTime,
-        startSeconds,
-        endSeconds,
-        matchScore,
-        note,
-      });
-    }
-
-    if (validatedMatches.length === 0) {
-      console.warn("[CreatorAI] matchScriptToFootage: No valid matches passed timestamp validation. Returning fallback.");
-      return { data: getFallbackMatches(trimmedScript, normalizedTranscript), source: "fallback", warning: "No valid matches passed timestamp bounds in matchScriptToFootage" };
-    }
-
-    setCachedValue(cacheKey, validatedMatches);
-    return { data: validatedMatches, source: "live" };
+    setCachedValue(cacheKey, execResult.data, execResult.provider);
+    return { data: execResult.data, source: "live", provider: execResult.provider };
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : "Unknown error";
-    console.warn(`[CreatorAI] matchScriptToFootage: API call failed (${errorMsg}). Returning fallback.`);
-    return { data: getFallbackMatches(trimmedScript, normalizedTranscript), source: "fallback", warning: `matchScriptToFootage failed: ${errorMsg}` };
+    console.warn(`[CreatorAI] matchScriptToFootage: All providers failed (${errorMsg}). Returning fallback.`);
+    return { data: getFallbackMatches(trimmedScript, normalizedTranscript), source: "fallback", provider: "fallback", warning: `matchScriptToFootage failed: ${errorMsg}` };
   }
 }
 
@@ -1389,9 +1391,11 @@ export async function generateCreatorInsights(stats: ContentStat[]): Promise<Cre
   const prompt = `Content Performance Data:\n${JSON.stringify(safeStats.slice(0, 30), null, 2)}\n\nGenerate strategic creator insights based on these metrics.`;
 
   try {
-    const response = await executeWithRetry(
+    const execResult = await executeTextModelChain<CreatorInsights>(
       async (modelName) => {
-        return await client.models.generateContent({
+        const { client } = getGenAIClient();
+        if (!client) throw new Error("GEMINI_API_KEY not configured");
+        const res = await client.models.generateContent({
           model: modelName,
           contents: prompt,
           config: {
@@ -1401,38 +1405,35 @@ export async function generateCreatorInsights(stats: ContentStat[]): Promise<Cre
             thinkingConfig: { thinkingBudget: 0 },
           },
         });
+        return res.text ?? "";
       },
+      (rawText) => {
+        const parsed = safeJsonParse<{
+          summary?: string;
+          patterns?: string[];
+          recommendations?: string[];
+          bestPostingWindow?: string;
+        }>(rawText);
+
+        if (!parsed || typeof parsed.summary !== "string") return null;
+
+        return {
+          summary: parsed.summary.trim() || heuristicSummary,
+          topPerformers,
+          patterns: Array.isArray(parsed.patterns) && parsed.patterns.length > 0 ? parsed.patterns : heuristicPatterns,
+          recommendations: Array.isArray(parsed.recommendations) && parsed.recommendations.length > 0 ? parsed.recommendations : heuristicRecs,
+          bestPostingWindow: parsed.bestPostingWindow?.trim() || defaultWindow,
+        };
+      },
+      systemInstruction,
+      prompt,
       "generateCreatorInsights"
     );
 
-    const rawText = response.text ?? "";
-    const parsed = safeJsonParse<{
-      summary?: string;
-      patterns?: string[];
-      recommendations?: string[];
-      bestPostingWindow?: string;
-    }>(rawText);
-
-    if (!parsed || typeof parsed.summary !== "string") {
-      return {
-        summary: heuristicSummary,
-        topPerformers,
-        patterns: heuristicPatterns,
-        recommendations: heuristicRecs,
-        bestPostingWindow: defaultWindow,
-      };
-    }
-
-    return {
-      summary: parsed.summary.trim() || heuristicSummary,
-      topPerformers,
-      patterns: Array.isArray(parsed.patterns) && parsed.patterns.length > 0 ? parsed.patterns : heuristicPatterns,
-      recommendations: Array.isArray(parsed.recommendations) && parsed.recommendations.length > 0 ? parsed.recommendations : heuristicRecs,
-      bestPostingWindow: parsed.bestPostingWindow?.trim() || defaultWindow,
-    };
+    return execResult.data;
   } catch (error) {
     console.warn(
-      `[CreatorAI] generateCreatorInsights: API call failed (${error instanceof Error ? error.message : "Unknown error"}). Returning locally computed insights.`
+      `[CreatorAI] generateCreatorInsights: All providers failed (${error instanceof Error ? error.message : "Unknown error"}). Returning locally computed insights.`
     );
     return {
       summary: heuristicSummary,
@@ -1461,10 +1462,12 @@ export async function runCreatorPipeline(input: PipelineInput): Promise<Pipeline
   let transcript = normalizeTranscript(input?.transcript ?? "");
   let scenes: VideoScene[] | undefined = undefined;
   let videoSource: ExecutionSource | undefined = undefined;
+  let videoProvider: ExecutionProvider | undefined = undefined;
 
   const apiKey = process.env.GEMINI_API_KEY ?? process.env.GOOGLE_API_KEY;
-  if (!apiKey || apiKey.trim() === "") {
-    warnings.push("API key is not configured; running pipeline with local heuristics and fallbacks.");
+  const groqKey = process.env.GROQ_API_KEY;
+  if ((!apiKey || apiKey.trim() === "") && (!groqKey || groqKey.trim() === "")) {
+    warnings.push("No AI API keys configured; running pipeline with local heuristics and fallbacks.");
   }
 
   // Step 1: Video Analysis (if video provided and transcript missing)
@@ -1473,6 +1476,7 @@ export async function runCreatorPipeline(input: PipelineInput): Promise<Pipeline
     transcript = videoRes.data.transcript;
     scenes = videoRes.data.scenes;
     videoSource = videoRes.source;
+    videoProvider = videoRes.provider;
     if (videoRes.warning) warnings.push(videoRes.warning);
     if (!transcript) {
       warnings.push("Video transcription produced no transcript; proceeding with fallback transcript.");
@@ -1521,6 +1525,13 @@ export async function runCreatorPipeline(input: PipelineInput): Promise<Pipeline
       suggestClips: clipsRes.source,
       matchScriptToFootage: matchesRes.source,
       adaptContent: adaptRes.source,
+    },
+    provider: {
+      videoAnalysis: videoProvider,
+      generateHooks: hooksRes.provider,
+      suggestClips: clipsRes.provider,
+      matchScriptToFootage: matchesRes.provider,
+      adaptContent: adaptRes.provider,
     },
   };
 }
