@@ -23,7 +23,8 @@ CreatorAi is an AI-powered creator operating platform automating script → foot
 
 ## Conventions
 - **Lazy Initialization**: Never initialize clients at top-level module scope; instantiate lazily to avoid runtime import failures when API keys are absent.
-- **Graceful Fallbacks**: Never throw on missing keys, API timeouts (~20s), or unparseable responses; log a warning (`[CreatorAI] ...`) and return typed dummy/heuristic data.
+- **Graceful Fallbacks**: Never throw on missing keys, API timeouts (~20s / 120s for video), or unparseable responses; log a warning (`[CreatorAI] ...`) and return typed dummy/heuristic data.
+- **In-Memory Caching**: AI calls are cached in memory (10-minute TTL) by SHA-256 hash of inputs.
 - **Defensive Parsing**: Use `config.responseSchema` with `responseMimeType: "application/json"`, and defensively parse JSON while stripping markdown code fences.
 - **Input Boundaries**: Guard against empty inputs and truncate large inputs (>30,000 chars).
 - **TypeScript & Docs**: Strict typing, no `any`, small private helpers, and full JSDoc comments on exported functions.
@@ -35,13 +36,15 @@ CreatorAi is an AI-powered creator operating platform automating script → foot
 - `matchScriptToFootage(scriptContent: string, videoTranscript: string): Promise<ScriptFootageMatch[]>` - Matches script beats to timeline footage.
 - `buildEditDecisionList(clips: ClipSuggestion[], opts?: { hook?: string; platform?: Platform }): EditDecisionList` - Pure function generating editable EDL timelines.
 - `generateCreatorInsights(stats: ContentStat[]): Promise<CreatorInsights>` - Computes creator engagement metrics and actionable recommendations.
+- `analyzeVideo(input: VideoAnalysisInput): Promise<VideoAnalysis>` - Multimodal video transcription and scene analysis.
+- `runCreatorPipeline(input: PipelineInput): Promise<PipelineResult>` - End-to-end orchestration pipeline with warnings and fallback collection.
 
 ## How to Add a New AI Function (5 Steps)
 1. Define strict input/output TypeScript types and response schemas using `Type` from `@google/genai`.
 2. Implement local heuristic fallback helper for offline/error handling.
 3. Add input guards (empty check + character limit truncation) and lazy client acquisition.
-4. Execute `client.models.generateContent` with a ~20s timeout race and structured output config.
-5. Validate/sanitize parsed results, sort/clamp fields, and return with typed fallbacks on failure.
+4. Execute `client.models.generateContent` with timeout race (20s/120s) and structured output config.
+5. Validate/sanitize parsed results, sort/clamp fields, cache valid results, and return with typed fallbacks on failure.
 
 ## Git & Workflow Rules
 - Branch: `feature/ai-pipeline`.

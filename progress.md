@@ -10,6 +10,10 @@
 | Creator Insights (`generateCreatorInsights`) | Done | `src/lib/ai/services.ts` |
 | Script-to-Footage Matching (`matchScriptToFootage`) | Done | `src/lib/ai/services.ts` |
 | Editable Edit-Decision-List Output (`buildEditDecisionList`) | Done | `src/lib/ai/services.ts` |
+| Video Analysis (`analyzeVideo` with 120s timeout) | Done | `src/lib/ai/services.ts` |
+| End-to-End Orchestrator (`runCreatorPipeline`) | Done | `src/lib/ai/services.ts` |
+| In-memory SHA-256 Cache (100 entries, 10m TTL) | Done | `src/lib/ai/utils.ts` |
+| API Reference Contract & Next.js Guide | Done | `docs/ai-api.md` |
 
 ## Environment Variables
 
@@ -21,9 +25,10 @@
 
 - Input length capped at 30,000 characters per field before sending to the model.
 - Transcript must contain timestamped cues (`[MM:SS]` / `HH:MM:SS`) for accurate clip extraction.
-- Gemini API calls enforce a 20-second timeout before falling back to local heuristic results.
+- Gemini API calls enforce a 20-second timeout for text operations and 120-second timeout for multimodal video operations.
 
 ## Changelog
 
-- **2026-10-04**: Added `adaptContent`, `matchScriptToFootage`, `buildEditDecisionList`, and `generateCreatorInsights` with refactored shared utilities (`src/lib/ai/utils.ts`, `src/lib/ai/types.ts`) and smoke tests (`scripts/ai-smoke.ts`).
+- **2026-10-04**: Added `analyzeVideo` (multimodal Gemini 120s timeout + upload lifecycle), `runCreatorPipeline` end-to-end orchestrator, SHA-256 in-memory cache, and `docs/ai-api.md` contract with live benchmarks (`scripts/ai-live.ts`).
+- **2026-10-04**: Added `adaptContent`, `matchScriptToFootage`, `buildEditDecisionList`, and `generateCreatorInsights` with shared utility decoupling.
 - **2026-10-04**: Added initial `generateHooks` and `suggestClips` implementation with defensive schemas and offline fallbacks.
