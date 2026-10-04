@@ -3,31 +3,28 @@ import path from "node:path";
 import { analyzeVideo, runCreatorPipeline } from "../src/lib/ai/services";
 
 async function main() {
-  const videoArg = process.argv[2];
+  const videoArg = process.argv[2] ?? "./sample.mp4";
 
   console.log("=== CreatorAI Video E2E Pipeline Script ===");
 
-  if (!videoArg) {
-    console.log("No video path provided in process.argv[2]. Running default fallback verification.");
-  }
+  const resolvedPath = path.resolve(videoArg);
+  const exists = fs.existsSync(resolvedPath);
 
-  const resolvedPath = videoArg ? path.resolve(videoArg) : null;
-  const exists = resolvedPath ? fs.existsSync(resolvedPath) : false;
-
-  console.log(`Target Video: ${videoArg ?? "None"}`);
+  console.log(`Target Video: ${videoArg}`);
   console.log(`File Exists: ${exists}`);
 
+  // Script matching the "Power of Small Habits" video theme
   const sampleScript =
-    "In this short video, I break down the 3 secrets to scaling short-form content. " +
-    "Secret 1: Stop over-editing and focus on the hook. " +
-    "Secret 2: Use multi-platform native aspect ratios. " +
-    "Secret 3: Publish consistently with automated pipelines.";
+    "Most people fail at their goals because they try to change everything overnight. " +
+    "The secret isn't massive action—it's the compounding power of small daily habits. " +
+    "When you improve just 1% each day, you become 37 times better in a year. " +
+    "Focus on identity-based habits, start small, and stay consistent.";
 
   // Step 1: analyzeVideo
   console.log("\n[1/2] Running analyzeVideo...");
   const t0 = performance.now();
   const videoAnalysis = await analyzeVideo({
-    filePath: exists ? resolvedPath! : undefined,
+    filePath: exists ? resolvedPath : undefined,
     fileUri: !exists && videoArg ? videoArg : undefined,
     mimeType: "video/mp4",
   });
@@ -62,7 +59,7 @@ async function main() {
   const pipelineResult = await runCreatorPipeline({
     script: sampleScript,
     video: {
-      filePath: exists ? resolvedPath! : undefined,
+      filePath: exists ? resolvedPath : undefined,
       fileUri: !exists && videoArg ? videoArg : undefined,
       mimeType: "video/mp4",
     },
@@ -73,12 +70,28 @@ async function main() {
   const pipelineLatency = ((t3 - t2) / 1000).toFixed(2);
   console.log(`runCreatorPipeline Latency: ${pipelineLatency}s`);
 
+  console.log("\n--- Per-Step Execution Source ---");
+  console.log(`  Video Analysis: ${pipelineResult.source.videoAnalysis ?? "N/A"}`);
+  console.log(`  Generate Hooks: ${pipelineResult.source.generateHooks}`);
+  console.log(`  Suggest Clips:  ${pipelineResult.source.suggestClips}`);
+  console.log(`  Match Footage:  ${pipelineResult.source.matchScriptToFootage}`);
+  console.log(`  Adapt Content:  ${pipelineResult.source.adaptContent}`);
+
   console.log("\nSuggested Clips:");
   if (pipelineResult.clips.length === 0) {
     console.log("  (No clips generated)");
   } else {
     pipelineResult.clips.forEach((clip, idx) => {
       console.log(`  Clip ${idx + 1} [${clip.startTime} - ${clip.endTime}] (Conf: ${clip.confidence}): ${clip.title}`);
+    });
+  }
+
+  console.log("\nMatched Script Beats:");
+  if (pipelineResult.matches.length === 0) {
+    console.log("  (No script matches)");
+  } else {
+    pipelineResult.matches.forEach((m, idx) => {
+      console.log(`  Beat ${idx + 1} [${m.startTime} - ${m.endTime}] (Score: ${m.matchScore}): ${m.scriptBeat}`);
     });
   }
 

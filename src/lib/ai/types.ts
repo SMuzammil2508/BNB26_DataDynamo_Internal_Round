@@ -112,6 +112,16 @@ export type PipelineInput = {
   platforms?: Platform[];
 };
 
+export type ExecutionSource = "live" | "fallback";
+
+export type PipelineSources = {
+  videoAnalysis?: ExecutionSource;
+  generateHooks: ExecutionSource;
+  suggestClips: ExecutionSource;
+  matchScriptToFootage: ExecutionSource;
+  adaptContent: ExecutionSource;
+};
+
 export type PipelineResult = {
   hooks: HookOption[] | string[];
   clips: ClipSuggestion[];
@@ -121,4 +131,5 @@ export type PipelineResult = {
   transcript: string;
   scenes?: VideoScene[];
   warnings: string[];
+  source: PipelineSources;
 };

@@ -3,7 +3,8 @@ import { createHash } from "node:crypto";
 
 export const MAX_INPUT_CHARS = 30_000;
 export const DEFAULT_MODEL = "gemini-2.5-flash";
-export const DEFAULT_API_TIMEOUT_MS = 20_000;
+export const FALLBACK_MODEL = "gemini-2.5-flash";
+export const TEXT_API_TIMEOUT_MS = 30_000;
 export const VIDEO_API_TIMEOUT_MS = 120_000;
 
 /**
@@ -58,18 +59,64 @@ export function setCachedValue<T>(key: string, value: T): void {
 /**
  * Lazily retrieves the GoogleGenAI client instance or null if API key is not configured.
  */
-export function getGenAIClient(): { client: GoogleGenAI | null; model: string } {
+export function getGenAIClient(): { client: GoogleGenAI | null; model: string; fallbackModel: string } {
   const apiKey = process.env.GEMINI_API_KEY ?? process.env.GOOGLE_API_KEY;
   const model = process.env.GEMINI_MODEL ?? DEFAULT_MODEL;
+  const fallbackModel = process.env.GEMINI_FALLBACK_MODEL ?? FALLBACK_MODEL;
 
   if (!apiKey || apiKey.trim() === "") {
-    return { client: null, model };
+    return { client: null, model, fallbackModel };
   }
 
   return {
     client: new GoogleGenAI({ apiKey: apiKey.trim() }),
     model,
+    fallbackModel,
   };
+}
+
+/**
+ * Normalizes transcript text by splitting timestamp cues like [MM:SS] or [HH:MM:SS] into distinct lines.
+ */
+export function normalizeTranscript(raw: string): string {
+  if (!raw || typeof raw !== "string") return "";
+
+  // Split on timestamp cues while keeping timestamps
+  const lines: string[] = [];
+  const cueRegex = /(?:\[|\b)(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)(?:\]|\b)/g;
+
+  const rawTrimmed = raw.trim();
+  if (!rawTrimmed) return "";
+
+  const matches: Array<{ timestamp: string; index: number }> = [];
+  let m: RegExpExecArray | null;
+
+  while ((m = cueRegex.exec(rawTrimmed)) !== null) {
+    matches.push({ timestamp: m[1], index: m.index });
+  }
+
+  if (matches.length === 0) {
+    return rawTrimmed;
+  }
+
+  for (let i = 0; i < matches.length; i++) {
+    const current = matches[i];
+    const next = matches[i + 1];
+    const startIndex = current.index;
+    const endIndex = next ? next.index : rawTrimmed.length;
+    const chunk = rawTrimmed.substring(startIndex, endIndex).trim();
+
+    // Clean up format into "[MM:SS] text"
+    const cleanedChunk = chunk
+      .replace(/^\[?(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)\]?\s*[-:]?\s*/, "[$1] ")
+      .trim();
+
+    if (cleanedChunk) {
+      lines.push(cleanedChunk);
+    }
+  }
+
+  return lines.join("\n");
 }
 
 /**
@@ -77,7 +124,7 @@ export function getGenAIClient(): { client: GoogleGenAI | null; model: string } 
  */
 export async function withTimeout<T>(
   promise: Promise<T>,
-  timeoutMs: number = DEFAULT_API_TIMEOUT_MS,
+  timeoutMs: number = TEXT_API_TIMEOUT_MS,
   operationName: string = "AI Operation"
 ): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
@@ -92,6 +139,50 @@ export async function withTimeout<T>(
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+/**
+ * Robust retry executor for text API calls with thinking budget = 0 and fallback model switching.
+ */
+export async function executeWithRetry<T>(
+  fn: (modelName: string) => Promise<T>,
+  operationName: string
+): Promise<T> {
+  const { client, model, fallbackModel } = getGenAIClient();
+  if (!client) {
+    throw new Error("API key not configured");
+  }
+
+  const modelsToTry = [model, fallbackModel];
+  let lastError: unknown;
+
+  for (const currentModel of modelsToTry) {
+    const attempts = currentModel === model ? 2 : 1;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        return await withTimeout(fn(currentModel), TEXT_API_TIMEOUT_MS, `${operationName} (${currentModel})`);
+      } catch (err) {
+        lastError = err;
+        const errMsg = err instanceof Error ? err.message : String(err);
+        const isRetryable =
+          errMsg.includes("429") ||
+          errMsg.includes("500") ||
+          errMsg.includes("503") ||
+          errMsg.includes("timed out") ||
+          errMsg.includes("high demand") ||
+          errMsg.includes("RESOURCE_EXHAUSTED");
+
+        if (attempt < attempts && isRetryable) {
+          const delayMs = attempt * 1000;
+          await new Promise((res) => setTimeout(res, delayMs));
+        } else {
+          break;
+        }
+      }
+    }
+  }
+
+  throw lastError;
 }
 
 /**
