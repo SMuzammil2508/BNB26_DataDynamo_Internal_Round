@@ -1,6 +1,9 @@
 import { Type, type Schema } from "@google/genai";
 import type {
   ClipSuggestion,
+  HookOption,
+  UppercasePlatform,
+  SinglePlatformAdaptation,
   Platform,
   PlatformAdaptation,
   ScriptFootageMatch,
@@ -29,6 +32,9 @@ import {
 
 export type {
   ClipSuggestion,
+  HookOption,
+  UppercasePlatform,
+  SinglePlatformAdaptation,
   Platform,
   PlatformAdaptation,
   ScriptFootageMatch,
@@ -46,18 +52,53 @@ export type {
 // Schemas
 // ============================================================================
 
-const hooksResponseSchema: Schema = {
+const structuredHooksResponseSchema: Schema = {
   type: Type.OBJECT,
   properties: {
     hooks: {
       type: Type.ARRAY,
       items: {
-        type: Type.STRING,
+        type: Type.OBJECT,
+        properties: {
+          hookText: {
+            type: Type.STRING,
+            description: "Engaging, scroll-stopping opening hook text (<= 140 chars).",
+          },
+          viralScore: {
+            type: Type.INTEGER,
+            description: "Predicted virality retention score between 0 and 100.",
+          },
+          emotionalType: {
+            type: Type.STRING,
+            description: "Emotional driver: 'FOMO', 'Curiosity', 'Pattern Interrupt', 'Bold Claim', or 'Pain Point'.",
+          },
+        },
+        required: ["hookText", "viralScore", "emotionalType"],
       },
-      description: "Exactly 3 distinct, engaging, scroll-stopping hooks (each <= 140 chars).",
+      description: "Exactly 3 distinct, high-impact hook options.",
     },
   },
   required: ["hooks"],
+};
+
+const singleAdaptContentResponseSchema: Schema = {
+  type: Type.OBJECT,
+  properties: {
+    title: {
+      type: Type.STRING,
+      description: "Platform-optimized punchy title.",
+    },
+    description: {
+      type: Type.STRING,
+      description: "Platform-native caption and description text.",
+    },
+    hashtags: {
+      type: Type.ARRAY,
+      items: { type: Type.STRING },
+      description: "Trending, relevant hashtags for the target platform.",
+    },
+  },
+  required: ["title", "description", "hashtags"],
 };
 
 const clipsResponseSchema: Schema = {
@@ -282,14 +323,53 @@ const PLATFORM_SPECS: Record<Platform, PlatformSpec> = {
 // Fallback Generators
 // ============================================================================
 
-function getFallbackHooks(scriptContent: string): string[] {
+function getFallbackHooks(scriptContent: string): HookOption[] {
   const seed = getFirstSentence(scriptContent);
-  const baseHooks = [
-    `Stop scrolling: If you care about ${seed}, you need to hear this right now.`,
-    `Most people get this completely wrong about ${seed}—here is what actually works.`,
-    `Are you struggling with ${seed}? Here is the exact fix in under 60 seconds.`,
+  return [
+    {
+      hookText: `Stop scrolling: If you care about ${seed}, you need to hear this right now.`.slice(0, 140),
+      viralScore: 94,
+      emotionalType: "FOMO",
+    },
+    {
+      hookText: `Most people get this completely wrong about ${seed}—here is what actually works.`.slice(0, 140),
+      viralScore: 91,
+      emotionalType: "Curiosity",
+    },
+    {
+      hookText: `Wait, why is nobody talking about this trick for ${seed}?`.slice(0, 140),
+      viralScore: 88,
+      emotionalType: "Pattern Interrupt",
+    },
   ];
-  return baseHooks.map((h) => (h.length > 140 ? `${h.slice(0, 137)}...` : h));
+}
+
+function getFallbackSingleAdaptation(script: string, platform: UppercasePlatform): SinglePlatformAdaptation {
+  const seed = getFirstSentence(script);
+  const normalized = platform.toUpperCase();
+
+  if (normalized === "TIKTOK") {
+    return {
+      title: `How to master ${seed}`.slice(0, 80),
+      description: `Stop struggling with ${seed}! Here is the exact breakdown in 60s. Drop a comment with your thoughts 👇`,
+      hashtags: ["#fyp", "#creator", "#viral", "#growthtips", "#trending"],
+    };
+  }
+
+  if (normalized === "REELS") {
+    return {
+      title: `The Secret to ${seed}`.slice(0, 80),
+      description: `Save this Reel for later! 📌 Everything you need to know about ${seed} in under 60 seconds.`,
+      hashtags: ["#reelsinstagram", "#creators", "#viralreels", "#businesstips", "#contentstrategy"],
+    };
+  }
+
+  // YOUTUBE
+  return {
+    title: `Do THIS for ${seed} (Complete Guide)`.slice(0, 100),
+    description: `In this video, discover the complete framework for ${seed}. Subscribe for weekly creator strategies and workflows.`,
+    hashtags: ["#Shorts", "#YouTubeShorts", "#ContentCreation", "#ViralStrategy"],
+  };
 }
 
 function getFallbackClips(scriptContent: string, videoTranscript: string): ClipSuggestion[] {
@@ -564,20 +644,20 @@ export async function analyzeVideo(input: VideoAnalysisInput): Promise<VideoAnal
 }
 
 /**
- * Generates exactly 3 distinct, scroll-stopping hook options for short-form video content based on a script.
+ * Generates structured, high-impact hook options containing hookText, viralScore (0-100), and emotionalType.
  *
  * @param scriptContent - The full or partial script text.
- * @returns An array of exactly 3 distinct hook strings (each <= 140 chars).
+ * @returns An array of 3 structured HookOption objects.
  */
-export async function generateHooks(scriptContent: string): Promise<string[]> {
+export async function generateHooks(scriptContent: string): Promise<HookOption[]> {
   const trimmedInput = (scriptContent ?? "").trim();
   if (!trimmedInput) {
     console.warn("[CreatorAI] generateHooks: Empty or whitespace input provided. Returning fallback hooks.");
     return getFallbackHooks("");
   }
 
-  const cacheKey = generateCacheKey("generateHooks", trimmedInput);
-  const cached = getCachedValue<string[]>(cacheKey);
+  const cacheKey = generateCacheKey("generateHooks_v2", trimmedInput);
+  const cached = getCachedValue<HookOption[]>(cacheKey);
   if (cached) return cached;
 
   const { client, model } = getGenAIClient();
@@ -589,14 +669,14 @@ export async function generateHooks(scriptContent: string): Promise<string[]> {
   const boundedInput = trimmedInput.slice(0, MAX_INPUT_CHARS);
   const systemInstruction =
     "You are an elite short-form content strategist for TikTok, YouTube Shorts, and Instagram Reels. " +
-    "Analyze the provided script and generate EXACTLY 3 distinct, engaging hook options. " +
+    "Analyze the provided script and generate EXACTLY 3 distinct, engaging hook options.\n" +
     "Requirements:\n" +
-    "- Each hook must be strictly <= 140 characters.\n" +
-    "- Use distinct angles across the 3 hooks: (1) Curiosity gap, (2) Bold/controversial claim, (3) Pain-point question.\n" +
-    "- First-line scroll-stopping style designed to maximize retention in the first 3 seconds.\n" +
+    "- hookText: strictly <= 140 characters, first-line scroll-stopping format.\n" +
+    "- viralScore: predicted virality and retention rating as an integer from 0 to 100.\n" +
+    "- emotionalType: psychological driver (e.g. 'FOMO', 'Curiosity', 'Pattern Interrupt', 'Bold Claim', 'Pain Point').\n" +
     "- Return only valid JSON conforming to the requested schema.";
 
-  const prompt = `Script Content:\n"""\n${boundedInput}\n"""\n\nGenerate 3 distinct hooks according to the instructions.`;
+  const prompt = `Script Content:\n"""\n${boundedInput}\n"""\n\nGenerate 3 distinct structured hooks.`;
 
   try {
     const response = await withTimeout(
@@ -606,7 +686,7 @@ export async function generateHooks(scriptContent: string): Promise<string[]> {
         config: {
           systemInstruction,
           responseMimeType: "application/json",
-          responseSchema: hooksResponseSchema,
+          responseSchema: structuredHooksResponseSchema,
         },
       }),
       DEFAULT_API_TIMEOUT_MS,
@@ -614,28 +694,43 @@ export async function generateHooks(scriptContent: string): Promise<string[]> {
     );
 
     const rawText = response.text ?? "";
-    const parsed = safeJsonParse<{ hooks?: string[] }>(rawText);
+    const parsed = safeJsonParse<{
+      hooks?: Array<{
+        hookText?: string;
+        viralScore?: number;
+        emotionalType?: string;
+      }>;
+    }>(rawText);
 
     if (!parsed || !Array.isArray(parsed.hooks)) {
       console.warn("[CreatorAI] generateHooks: Failed to parse valid hooks JSON from model response. Returning fallback.");
       return getFallbackHooks(trimmedInput);
     }
 
-    const cleanedHooks: string[] = [];
-    for (const hook of parsed.hooks) {
-      if (typeof hook === "string") {
-        const t = hook.trim();
-        if (t.length > 0 && !cleanedHooks.includes(t)) {
-          cleanedHooks.push(t.length > 140 ? `${t.slice(0, 137)}...` : t);
-        }
-      }
+    const cleanedHooks: HookOption[] = [];
+    for (const h of parsed.hooks) {
+      if (!h || typeof h !== "object") continue;
+      const hookText = typeof h.hookText === "string" ? h.hookText.trim() : "";
+      if (!hookText) continue;
+
+      const rawScore = typeof h.viralScore === "number" ? Math.round(h.viralScore) : 85;
+      const viralScore = Math.max(0, Math.min(100, rawScore));
+      const emotionalType = typeof h.emotionalType === "string" && h.emotionalType.trim()
+        ? h.emotionalType.trim()
+        : "Curiosity";
+
+      cleanedHooks.push({
+        hookText: hookText.length > 140 ? `${hookText.slice(0, 137)}...` : hookText,
+        viralScore,
+        emotionalType,
+      });
     }
 
     if (cleanedHooks.length < 3) {
       const fallbackList = getFallbackHooks(trimmedInput);
       for (const fallback of fallbackList) {
         if (cleanedHooks.length >= 3) break;
-        if (!cleanedHooks.includes(fallback)) {
+        if (!cleanedHooks.some((item) => item.hookText === fallback.hookText)) {
           cleanedHooks.push(fallback);
         }
       }
@@ -781,21 +876,99 @@ export async function suggestClips(
   }
 }
 
-/**
- * Adapts script content across specified social media platforms, enforcing platform-specific formatting and length limits.
- *
- * @param scriptContent - Base script or content draft.
- * @param platforms - Array of target platforms.
- * @returns An array of PlatformAdaptation objects tailored and clamped to each platform's rules.
- */
+// Function signature overloads for adaptContent
+export async function adaptContent(
+  script: string,
+  platform: UppercasePlatform
+): Promise<SinglePlatformAdaptation>;
 export async function adaptContent(
   scriptContent: string,
   platforms: Platform[]
-): Promise<PlatformAdaptation[]> {
-  const targetPlatforms: Platform[] = Array.isArray(platforms) && platforms.length > 0
-    ? platforms
-    : (["youtube_shorts"] as Platform[]);
+): Promise<PlatformAdaptation[]>;
+
+/**
+ * Adapts script content across specified social media platforms or single uppercase platform targets.
+ */
+export async function adaptContent(
+  scriptContent: string,
+  platformOrPlatforms: Platform[] | UppercasePlatform
+): Promise<PlatformAdaptation[] | SinglePlatformAdaptation> {
   const trimmedInput = (scriptContent ?? "").trim();
+
+  // Case 1: Single Uppercase Platform ('TIKTOK' | 'REELS' | 'YOUTUBE')
+  if (typeof platformOrPlatforms === "string") {
+    const singlePlatform = platformOrPlatforms.toUpperCase() as UppercasePlatform;
+    if (!trimmedInput) {
+      console.warn(`[CreatorAI] adaptContent: Empty script provided for ${singlePlatform}. Returning fallback.`);
+      return getFallbackSingleAdaptation("", singlePlatform);
+    }
+
+    const cacheKey = generateCacheKey("adaptContent_single", { trimmedInput, singlePlatform });
+    const cached = getCachedValue<SinglePlatformAdaptation>(cacheKey);
+    if (cached) return cached;
+
+    const { client, model } = getGenAIClient();
+    if (!client) {
+      console.warn(`[CreatorAI] adaptContent: API key not set. Returning fallback for ${singlePlatform}.`);
+      return getFallbackSingleAdaptation(trimmedInput, singlePlatform);
+    }
+
+    const boundedInput = trimmedInput.slice(0, MAX_INPUT_CHARS);
+    const systemInstruction =
+      `You are a viral social media strategist specializing in ${singlePlatform}. ` +
+      `Generate a platform-optimized title, description/caption, and 3-5 high-performing trending hashtags.\n` +
+      `Return only valid JSON matching the schema.`;
+
+    const prompt = `Script Content:\n"""\n${boundedInput}\n"""\n\nGenerate optimized title, description, and hashtags for ${singlePlatform}.`;
+
+    try {
+      const response = await withTimeout(
+        client.models.generateContent({
+          model,
+          contents: prompt,
+          config: {
+            systemInstruction,
+            responseMimeType: "application/json",
+            responseSchema: singleAdaptContentResponseSchema,
+          },
+        }),
+        DEFAULT_API_TIMEOUT_MS,
+        "adaptContent_single"
+      );
+
+      const rawText = response.text ?? "";
+      const parsed = safeJsonParse<SinglePlatformAdaptation>(rawText);
+
+      if (!parsed || !parsed.title || !parsed.description) {
+        return getFallbackSingleAdaptation(trimmedInput, singlePlatform);
+      }
+
+      const hashtags = Array.isArray(parsed.hashtags)
+        ? parsed.hashtags
+            .filter((h): h is string => typeof h === "string" && h.trim().length > 0)
+            .map((h) => (h.startsWith("#") ? h.trim() : `#${h.trim()}`))
+        : ["#viral", "#content", "#growth"];
+
+      const result: SinglePlatformAdaptation = {
+        title: parsed.title.trim(),
+        description: parsed.description.trim(),
+        hashtags: hashtags.length > 0 ? hashtags : ["#viral", "#content"],
+      };
+
+      setCachedValue(cacheKey, result);
+      return result;
+    } catch (error) {
+      console.warn(
+        `[CreatorAI] adaptContent: API call failed for ${singlePlatform} (${error instanceof Error ? error.message : "Unknown error"}). Returning fallback.`
+      );
+      return getFallbackSingleAdaptation(trimmedInput, singlePlatform);
+    }
+  }
+
+  // Case 2: Array of lowercase Platforms
+  const targetPlatforms: Platform[] = Array.isArray(platformOrPlatforms) && platformOrPlatforms.length > 0
+    ? platformOrPlatforms
+    : (["youtube_shorts"] as Platform[]);
 
   if (!trimmedInput) {
     console.warn("[CreatorAI] adaptContent: Empty script input provided. Returning fallback adaptations.");
@@ -1142,6 +1315,9 @@ export async function generateCreatorInsights(stats: ContentStat[]): Promise<Cre
     };
   }
 
+  const systemInstruction =
+    "You are a creator economy analytics specialist. Analyze the provided metrics and deliver a high-impact narrative summary, patterns, and recommendations. Return only valid JSON conforming to the schema.";
+
   const prompt = `Content Performance Data:\n${JSON.stringify(safeStats.slice(0, 30), null, 2)}\n\nGenerate strategic creator insights based on these metrics.`;
 
   try {
@@ -1150,8 +1326,7 @@ export async function generateCreatorInsights(stats: ContentStat[]): Promise<Cre
         model,
         contents: prompt,
         config: {
-          systemInstruction:
-            "You are a creator economy analytics specialist. Analyze the provided metrics and deliver a high-impact narrative summary, patterns, and recommendations. Return only valid JSON conforming to the schema.",
+          systemInstruction,
           responseMimeType: "application/json",
           responseSchema: insightsNarrativeSchema,
         },
@@ -1252,7 +1427,7 @@ export async function runCreatorPipeline(input: PipelineInput): Promise<Pipeline
   ]);
 
   // Step 3: EDL Timeline compilation (pure function)
-  const primaryHook = hooks[0] ?? "";
+  const primaryHook = hooks[0] ? (typeof hooks[0] === "string" ? hooks[0] : hooks[0].hookText) : "";
   const edl = buildEditDecisionList(clips, {
     hook: primaryHook,
     platform: targetPlatforms[0],

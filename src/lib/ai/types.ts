@@ -8,12 +8,26 @@ export type ClipSuggestion = {
   confidence: number; // 0..1
 };
 
+export type HookOption = {
+  hookText: string;
+  viralScore: number; // 0-100
+  emotionalType: string; // e.g. 'FOMO', 'Curiosity', 'Pattern Interrupt'
+};
+
+export type UppercasePlatform = "TIKTOK" | "REELS" | "YOUTUBE";
+
 export type Platform =
   | "youtube_shorts"
   | "instagram_reels"
   | "tiktok"
   | "x"
   | "linkedin";
+
+export type SinglePlatformAdaptation = {
+  title: string;
+  description: string;
+  hashtags: string[];
+};
 
 export type PlatformAdaptation = {
   platform: Platform;
@@ -99,7 +113,7 @@ export type PipelineInput = {
 };
 
 export type PipelineResult = {
-  hooks: string[];
+  hooks: HookOption[] | string[];
   clips: ClipSuggestion[];
   matches: ScriptFootageMatch[];
   edl: EditDecisionList;

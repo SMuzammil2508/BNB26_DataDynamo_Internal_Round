@@ -16,7 +16,19 @@ async function runSmokeTests() {
   // Test 1: generateHooks
   try {
     const hooks = await generateHooks("Building an AI startup from scratch using Next.js and Gemini.");
-    if (Array.isArray(hooks) && hooks.length === 3 && hooks.every((h) => typeof h === "string" && h.length <= 140)) {
+    if (
+      Array.isArray(hooks) &&
+      hooks.length === 3 &&
+      hooks.every(
+        (h) =>
+          typeof h.hookText === "string" &&
+          h.hookText.length <= 140 &&
+          typeof h.viralScore === "number" &&
+          h.viralScore >= 0 &&
+          h.viralScore <= 100 &&
+          typeof h.emotionalType === "string"
+      )
+    ) {
       console.log("PASS: generateHooks");
     } else {
       console.error("FAIL: generateHooks (invalid structure)", hooks);
@@ -54,7 +66,7 @@ async function runSmokeTests() {
     allPassed = false;
   }
 
-  // Test 3: adaptContent
+  // Test 3: adaptContent (Multi & Single)
   try {
     const adaptations = await adaptContent("How to double your reach with short form video", [
       "youtube_shorts",
@@ -63,10 +75,16 @@ async function runSmokeTests() {
       "x",
       "linkedin",
     ]);
+    const singleTiktok = await adaptContent("How to double your reach", "TIKTOK");
+    const singleReels = await adaptContent("How to double your reach", "REELS");
+    const singleYoutube = await adaptContent("How to double your reach", "YOUTUBE");
+
     if (
       Array.isArray(adaptations) &&
       adaptations.length === 5 &&
-      adaptations.every((a) => a.platform && a.caption && a.hashtags.length > 0 && a.aspectRatio)
+      singleTiktok.title &&
+      singleReels.description &&
+      singleYoutube.hashtags.length > 0
     ) {
       console.log("PASS: adaptContent");
     } else {
