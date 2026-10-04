@@ -6,7 +6,7 @@ export default async function HomePage() {
   let count = 0;
 
   try {
-    count = await prisma.example.count();
+    count = await prisma.project.count();
   } catch {
     dbStatus = "Connection error";
   }
