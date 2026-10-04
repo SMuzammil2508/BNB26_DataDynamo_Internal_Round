@@ -69,3 +69,42 @@ export type CreatorInsights = {
   recommendations: string[];
   bestPostingWindow?: string;
 };
+
+export type VideoScene = {
+  startSeconds: number;
+  endSeconds: number;
+  startTime: string;
+  endTime: string;
+  description: string;
+  visualTags: string[];
+};
+
+export type VideoAnalysis = {
+  transcript: string;
+  scenes: VideoScene[];
+  durationSeconds?: number;
+};
+
+export type VideoAnalysisInput = {
+  fileUri?: string;
+  filePath?: string;
+  mimeType: string;
+};
+
+export type PipelineInput = {
+  script: string;
+  video?: VideoAnalysisInput;
+  transcript?: string;
+  platforms?: Platform[];
+};
+
+export type PipelineResult = {
+  hooks: string[];
+  clips: ClipSuggestion[];
+  matches: ScriptFootageMatch[];
+  edl: EditDecisionList;
+  adaptations: PlatformAdaptation[];
+  transcript: string;
+  scenes?: VideoScene[];
+  warnings: string[];
+};

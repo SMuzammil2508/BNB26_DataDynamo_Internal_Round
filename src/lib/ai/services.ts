@@ -7,6 +7,11 @@ import type {
   EditDecisionList,
   ContentStat,
   CreatorInsights,
+  VideoScene,
+  VideoAnalysis,
+  VideoAnalysisInput,
+  PipelineInput,
+  PipelineResult,
 } from "./types";
 import {
   getGenAIClient,
@@ -14,8 +19,12 @@ import {
   safeJsonParse,
   withTimeout,
   getFirstSentence,
+  generateCacheKey,
+  getCachedValue,
+  setCachedValue,
   MAX_INPUT_CHARS,
-  API_TIMEOUT_MS,
+  DEFAULT_API_TIMEOUT_MS,
+  VIDEO_API_TIMEOUT_MS,
 } from "./utils";
 
 export type {
@@ -26,6 +35,11 @@ export type {
   EditDecisionList,
   ContentStat,
   CreatorInsights,
+  VideoScene,
+  VideoAnalysis,
+  VideoAnalysisInput,
+  PipelineInput,
+  PipelineResult,
 };
 
 // ============================================================================
@@ -154,6 +168,39 @@ const matchScriptResponseSchema: Schema = {
     },
   },
   required: ["matches"],
+};
+
+const videoAnalysisResponseSchema: Schema = {
+  type: Type.OBJECT,
+  properties: {
+    transcript: {
+      type: Type.STRING,
+      description: "Full timestamped transcript with lines formatted exactly as '[MM:SS] text'.",
+    },
+    scenes: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          startTime: { type: Type.STRING, description: "Start time in transcript format." },
+          endTime: { type: Type.STRING, description: "End time in transcript format." },
+          description: { type: Type.STRING, description: "Detailed visual and narrative description." },
+          visualTags: {
+            type: Type.ARRAY,
+            items: { type: Type.STRING },
+            description: "Visual elements, actions, or b-roll tags.",
+          },
+        },
+        required: ["startTime", "endTime", "description", "visualTags"],
+      },
+      description: "Chronological scenes identified in the footage.",
+    },
+    durationSeconds: {
+      type: Type.NUMBER,
+      description: "Total estimated duration in seconds.",
+    },
+  },
+  required: ["transcript", "scenes"],
 };
 
 const insightsNarrativeSchema: Schema = {
@@ -350,9 +397,169 @@ function getFallbackMatches(scriptContent: string, videoTranscript: string): Scr
   }));
 }
 
+function getFallbackVideoAnalysis(): VideoAnalysis {
+  return {
+    transcript: "",
+    scenes: [],
+    durationSeconds: 0,
+  };
+}
+
 // ============================================================================
 // Public API Implementations
 // ============================================================================
+
+/**
+ * Analyzes video files or URIs via Gemini multimodal capabilities, returning a timestamped transcript and visual scene breakdown.
+ *
+ * @param input - Video source information (filePath or fileUri, and mimeType).
+ * @returns A VideoAnalysis object containing timestamped transcript and scene details.
+ */
+export async function analyzeVideo(input: VideoAnalysisInput): Promise<VideoAnalysis> {
+  const { fileUri, filePath, mimeType } = input || {};
+  if (!fileUri && !filePath) {
+    console.warn("[CreatorAI] analyzeVideo: No fileUri or filePath provided. Returning fallback video analysis.");
+    return getFallbackVideoAnalysis();
+  }
+
+  const { client, model } = getGenAIClient();
+  if (!client) {
+    console.warn("[CreatorAI] analyzeVideo: GEMINI_API_KEY / GOOGLE_API_KEY is not set. Returning fallback video analysis.");
+    return getFallbackVideoAnalysis();
+  }
+
+  let uploadedFileName: string | undefined;
+
+  try {
+    let targetUri = fileUri;
+    let targetMimeType = mimeType || "video/mp4";
+
+    // Handle local file upload
+    if (!targetUri && filePath) {
+      const uploadResult = await client.files.upload({
+        file: filePath,
+        mimeType: targetMimeType,
+      });
+      uploadedFileName = uploadResult.name;
+      targetUri = uploadResult.uri;
+
+      // Poll until file state is ACTIVE
+      let fileInfo = await client.files.get({ name: uploadResult.name });
+      let attempts = 0;
+      while (fileInfo.state === "PROCESSING" && attempts < 30) {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        fileInfo = await client.files.get({ name: uploadResult.name });
+        attempts++;
+      }
+
+      if (fileInfo.state !== "ACTIVE") {
+        throw new Error(`Uploaded file failed to activate (state: ${fileInfo.state})`);
+      }
+    }
+
+    if (!targetUri) {
+      throw new Error("Unable to obtain valid file URI for analysis");
+    }
+
+    const systemInstruction =
+      "You are an expert video transcriber and visual scene analyzer. " +
+      "Analyze the video footage and provide:\n" +
+      "1. A complete timestamped transcript formatted with '[MM:SS] spoken text' per line.\n" +
+      "2. A chronological scene breakdown with start/end timestamps, description, and visual tags.\n" +
+      "Return only valid JSON matching the schema.";
+
+    const prompt = "Transcribe this video footage with exact timestamps and extract key visual scenes.";
+
+    const response = await withTimeout(
+      client.models.generateContent({
+        model,
+        contents: [
+          {
+            role: "user",
+            parts: [
+              {
+                fileData: {
+                  fileUri: targetUri,
+                  mimeType: targetMimeType,
+                },
+              },
+              { text: prompt },
+            ],
+          },
+        ],
+        config: {
+          systemInstruction,
+          responseMimeType: "application/json",
+          responseSchema: videoAnalysisResponseSchema,
+        },
+      }),
+      VIDEO_API_TIMEOUT_MS,
+      "analyzeVideo"
+    );
+
+    const rawText = response.text ?? "";
+    const parsed = safeJsonParse<{
+      transcript?: string;
+      scenes?: Array<{
+        startTime?: string;
+        endTime?: string;
+        description?: string;
+        visualTags?: string[];
+      }>;
+      durationSeconds?: number;
+    }>(rawText);
+
+    if (!parsed || typeof parsed.transcript !== "string") {
+      console.warn("[CreatorAI] analyzeVideo: Failed to parse valid video analysis JSON from model response.");
+      return getFallbackVideoAnalysis();
+    }
+
+    const scenes: VideoScene[] = [];
+    if (Array.isArray(parsed.scenes)) {
+      for (const rawScene of parsed.scenes) {
+        if (!rawScene) continue;
+        const startTime = typeof rawScene.startTime === "string" ? rawScene.startTime.trim() : "00:00";
+        const endTime = typeof rawScene.endTime === "string" ? rawScene.endTime.trim() : "00:00";
+        const startSeconds = timeToSeconds(startTime);
+        const endSeconds = timeToSeconds(endTime);
+
+        if (Number.isNaN(startSeconds) || Number.isNaN(endSeconds) || endSeconds <= startSeconds) {
+          continue;
+        }
+
+        scenes.push({
+          startTime,
+          endTime,
+          startSeconds,
+          endSeconds,
+          description: typeof rawScene.description === "string" ? rawScene.description.trim() : "Scene",
+          visualTags: Array.isArray(rawScene.visualTags)
+            ? rawScene.visualTags.filter((t): t is string => typeof t === "string")
+            : [],
+        });
+      }
+    }
+
+    return {
+      transcript: parsed.transcript.trim(),
+      scenes,
+      durationSeconds: parsed.durationSeconds || (scenes[scenes.length - 1]?.endSeconds ?? 0),
+    };
+  } catch (error) {
+    console.warn(
+      `[CreatorAI] analyzeVideo: Video analysis failed (${error instanceof Error ? error.message : "Unknown error"}). Returning fallback.`
+    );
+    return getFallbackVideoAnalysis();
+  } finally {
+    if (uploadedFileName && client) {
+      try {
+        await client.files.delete({ name: uploadedFileName });
+      } catch {
+        // Best-effort cleanup
+      }
+    }
+  }
+}
 
 /**
  * Generates exactly 3 distinct, scroll-stopping hook options for short-form video content based on a script.
@@ -366,6 +573,10 @@ export async function generateHooks(scriptContent: string): Promise<string[]> {
     console.warn("[CreatorAI] generateHooks: Empty or whitespace input provided. Returning fallback hooks.");
     return getFallbackHooks("");
   }
+
+  const cacheKey = generateCacheKey("generateHooks", trimmedInput);
+  const cached = getCachedValue<string[]>(cacheKey);
+  if (cached) return cached;
 
   const { client, model } = getGenAIClient();
   if (!client) {
@@ -396,7 +607,7 @@ export async function generateHooks(scriptContent: string): Promise<string[]> {
           responseSchema: hooksResponseSchema,
         },
       }),
-      API_TIMEOUT_MS,
+      DEFAULT_API_TIMEOUT_MS,
       "generateHooks"
     );
 
@@ -428,7 +639,9 @@ export async function generateHooks(scriptContent: string): Promise<string[]> {
       }
     }
 
-    return cleanedHooks.slice(0, 3);
+    const result = cleanedHooks.slice(0, 3);
+    setCachedValue(cacheKey, result);
+    return result;
   } catch (error) {
     console.warn(
       `[CreatorAI] generateHooks: API call failed or encountered an error (${error instanceof Error ? error.message : "Unknown error"}). Returning fallback.`
@@ -455,6 +668,10 @@ export async function suggestClips(
     console.warn("[CreatorAI] suggestClips: Empty script and transcript provided. Returning fallback clips.");
     return getFallbackClips("", "");
   }
+
+  const cacheKey = generateCacheKey("suggestClips", { trimmedScript, trimmedTranscript });
+  const cached = getCachedValue<ClipSuggestion[]>(cacheKey);
+  if (cached) return cached;
 
   const { client, model } = getGenAIClient();
   if (!client) {
@@ -492,7 +709,7 @@ export async function suggestClips(
           responseSchema: clipsResponseSchema,
         },
       }),
-      API_TIMEOUT_MS,
+      DEFAULT_API_TIMEOUT_MS,
       "suggestClips"
     );
 
@@ -551,7 +768,9 @@ export async function suggestClips(
     }
 
     validatedClips.sort((a, b) => b.confidence - a.confidence);
-    return validatedClips.slice(0, 5);
+    const result = validatedClips.slice(0, 5);
+    setCachedValue(cacheKey, result);
+    return result;
   } catch (error) {
     console.warn(
       `[CreatorAI] suggestClips: API call failed or encountered an error (${error instanceof Error ? error.message : "Unknown error"}). Returning fallback.`
@@ -579,6 +798,10 @@ export async function adaptContent(
     return getFallbackAdaptations("", targetPlatforms);
   }
 
+  const cacheKey = generateCacheKey("adaptContent", { trimmedInput, targetPlatforms });
+  const cached = getCachedValue<PlatformAdaptation[]>(cacheKey);
+  if (cached) return cached;
+
   const { client, model } = getGenAIClient();
   if (!client) {
     console.warn("[CreatorAI] adaptContent: GEMINI_API_KEY / GOOGLE_API_KEY is not set. Returning fallback adaptations.");
@@ -604,7 +827,7 @@ export async function adaptContent(
           responseSchema: adaptContentResponseSchema,
         },
       }),
-      API_TIMEOUT_MS,
+      DEFAULT_API_TIMEOUT_MS,
       "adaptContent"
     );
 
@@ -654,7 +877,6 @@ export async function adaptContent(
       });
     }
 
-    // Ensure all requested platforms are covered; fill missing with fallback
     const finalAdaptations: PlatformAdaptation[] = [];
     const fallbackList = getFallbackAdaptations(trimmedInput, targetPlatforms);
 
@@ -667,6 +889,7 @@ export async function adaptContent(
       }
     }
 
+    setCachedValue(cacheKey, finalAdaptations);
     return finalAdaptations;
   } catch (error) {
     console.warn(
@@ -694,6 +917,10 @@ export async function matchScriptToFootage(
     console.warn("[CreatorAI] matchScriptToFootage: Missing script or transcript. Returning fallback matches.");
     return getFallbackMatches(trimmedScript, trimmedTranscript);
   }
+
+  const cacheKey = generateCacheKey("matchScriptToFootage", { trimmedScript, trimmedTranscript });
+  const cached = getCachedValue<ScriptFootageMatch[]>(cacheKey);
+  if (cached) return cached;
 
   const { client, model } = getGenAIClient();
   if (!client) {
@@ -724,7 +951,7 @@ export async function matchScriptToFootage(
           responseSchema: matchScriptResponseSchema,
         },
       }),
-      API_TIMEOUT_MS,
+      DEFAULT_API_TIMEOUT_MS,
       "matchScriptToFootage"
     );
 
@@ -781,6 +1008,7 @@ export async function matchScriptToFootage(
       return getFallbackMatches(trimmedScript, trimmedTranscript);
     }
 
+    setCachedValue(cacheKey, validatedMatches);
     return validatedMatches;
   } catch (error) {
     console.warn(
@@ -806,7 +1034,6 @@ export function buildEditDecisionList(
 
   let timelineCursor = 0;
 
-  // Add optional opening hook overlay
   if (opts?.hook && opts.hook.trim().length > 0) {
     const hookDuration = Math.min(3, safeClips[0] ? Math.max(1, safeClips[0].endSeconds - safeClips[0].startSeconds) : 3);
     items.push({
@@ -819,7 +1046,6 @@ export function buildEditDecisionList(
     });
   }
 
-  // Add video clips and auto-generated captions
   safeClips.forEach((clip, index) => {
     const duration = Math.max(1, clip.endSeconds - clip.startSeconds);
     const clipStart = timelineCursor;
@@ -875,7 +1101,6 @@ export async function generateCreatorInsights(stats: ContentStat[]): Promise<Cre
     };
   }
 
-  // Local metric computation
   const scoredStats = safeStats.map((stat) => {
     const views = Math.max(0, stat.views || 0);
     const interactions = (stat.likes || 0) + (stat.comments || 0) * 2 + (stat.shares || 0) * 3;
@@ -889,7 +1114,6 @@ export async function generateCreatorInsights(stats: ContentStat[]): Promise<Cre
   const totalViews = safeStats.reduce((sum, s) => sum + (s.views || 0), 0);
   const avgViews = Math.round(totalViews / safeStats.length);
 
-  // Heuristic baseline narrative
   const heuristicSummary = `Analyzed ${safeStats.length} content posts with ${totalViews.toLocaleString()} total views (avg ${avgViews.toLocaleString()} views/post). Top performers demonstrated significantly higher comment and share ratios.`;
   const heuristicPatterns = [
     `Videos under 45 seconds showed higher completion and re-watch rates.`,
@@ -927,7 +1151,7 @@ export async function generateCreatorInsights(stats: ContentStat[]): Promise<Cre
           responseSchema: insightsNarrativeSchema,
         },
       }),
-      API_TIMEOUT_MS,
+      DEFAULT_API_TIMEOUT_MS,
       "generateCreatorInsights"
     );
 
@@ -968,4 +1192,81 @@ export async function generateCreatorInsights(stats: ContentStat[]): Promise<Cre
       bestPostingWindow: defaultWindow,
     };
   }
+}
+
+/**
+ * End-to-end orchestrator for the CreatorAi operating workflow:
+ * video analysis (if needed) -> parallel hooks/clips/matches -> EDL compilation -> multi-platform adaptation.
+ *
+ * @param input - Configuration containing script, optional video input, transcript, and target platforms.
+ * @returns A consolidated PipelineResult object containing all generated assets and diagnostic warnings.
+ */
+export async function runCreatorPipeline(input: PipelineInput): Promise<PipelineResult> {
+  const warnings: string[] = [];
+  const script = input?.script ?? "";
+  const targetPlatforms: Platform[] = input?.platforms && input.platforms.length > 0
+    ? input.platforms
+    : ["youtube_shorts", "instagram_reels", "tiktok"];
+
+  let transcript = input?.transcript ?? "";
+  let scenes: VideoScene[] | undefined = undefined;
+
+  const apiKey = process.env.GEMINI_API_KEY ?? process.env.GOOGLE_API_KEY;
+  if (!apiKey || apiKey.trim() === "") {
+    warnings.push("API key is not configured; running pipeline with local heuristics and fallbacks.");
+  }
+
+  // Step 1: Video Analysis (if video provided and transcript missing)
+  if (!transcript && input?.video) {
+    try {
+      const videoResult = await analyzeVideo(input.video);
+      transcript = videoResult.transcript;
+      scenes = videoResult.scenes;
+      if (!transcript) {
+        warnings.push("Video transcription produced no transcript; proceeding with empty transcript.");
+      }
+    } catch (err) {
+      warnings.push(`Video analysis failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+    }
+  }
+
+  // Step 2: Parallel execution of hooks, clips, and footage matching
+  const [hooks, clips, matches] = await Promise.all([
+    generateHooks(script).catch((err) => {
+      warnings.push(`Hook generation fallback triggered: ${err instanceof Error ? err.message : "Unknown error"}`);
+      return getFallbackHooks(script);
+    }),
+    suggestClips(script, transcript).catch((err) => {
+      warnings.push(`Clip suggestion fallback triggered: ${err instanceof Error ? err.message : "Unknown error"}`);
+      return getFallbackClips(script, transcript);
+    }),
+    matchScriptToFootage(script, transcript).catch((err) => {
+      warnings.push(`Script matching fallback triggered: ${err instanceof Error ? err.message : "Unknown error"}`);
+      return getFallbackMatches(script, transcript);
+    }),
+  ]);
+
+  // Step 3: EDL Timeline compilation (pure function)
+  const primaryHook = hooks[0] ?? "";
+  const edl = buildEditDecisionList(clips, {
+    hook: primaryHook,
+    platform: targetPlatforms[0],
+  });
+
+  // Step 4: Multi-platform adaptations
+  const adaptations = await adaptContent(script, targetPlatforms).catch((err) => {
+    warnings.push(`Platform adaptation fallback triggered: ${err instanceof Error ? err.message : "Unknown error"}`);
+    return getFallbackAdaptations(script, targetPlatforms);
+  });
+
+  return {
+    hooks,
+    clips,
+    matches,
+    edl,
+    adaptations,
+    transcript,
+    scenes,
+    warnings,
+  };
 }

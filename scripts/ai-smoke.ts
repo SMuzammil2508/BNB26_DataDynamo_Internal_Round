@@ -5,6 +5,8 @@ import {
   matchScriptToFootage,
   buildEditDecisionList,
   generateCreatorInsights,
+  analyzeVideo,
+  runCreatorPipeline,
 } from "../src/lib/ai/services";
 
 async function runSmokeTests() {
@@ -173,6 +175,49 @@ async function runSmokeTests() {
     }
   } catch (err) {
     console.error("FAIL: generateCreatorInsights threw error", err);
+    allPassed = false;
+  }
+
+  // Test 7: analyzeVideo (fallback check)
+  try {
+    const analysis = await analyzeVideo({ fileUri: "https://example.com/sample.mp4", mimeType: "video/mp4" });
+    if (analysis && typeof analysis.transcript === "string" && Array.isArray(analysis.scenes)) {
+      console.log("PASS: analyzeVideo (fallback)");
+    } else {
+      console.error("FAIL: analyzeVideo (invalid structure)", analysis);
+      allPassed = false;
+    }
+  } catch (err) {
+    console.error("FAIL: analyzeVideo threw error", err);
+    allPassed = false;
+  }
+
+  // Test 8: runCreatorPipeline (fallback check)
+  try {
+    const pipelineRes = await runCreatorPipeline({
+      script: "In this guide, learn how to automate creator workflows with AI.",
+      transcript: "[00:00] Intro to AI tools [00:20] How pipelines work [00:50] Summary",
+      platforms: ["youtube_shorts", "tiktok"],
+    });
+
+    if (
+      pipelineRes &&
+      Array.isArray(pipelineRes.hooks) &&
+      Array.isArray(pipelineRes.clips) &&
+      Array.isArray(pipelineRes.matches) &&
+      pipelineRes.edl &&
+      Array.isArray(pipelineRes.adaptations) &&
+      typeof pipelineRes.transcript === "string" &&
+      Array.isArray(pipelineRes.warnings) &&
+      pipelineRes.warnings.length > 0
+    ) {
+      console.log("PASS: runCreatorPipeline (fallback & warnings)");
+    } else {
+      console.error("FAIL: runCreatorPipeline (invalid structure)", pipelineRes);
+      allPassed = false;
+    }
+  } catch (err) {
+    console.error("FAIL: runCreatorPipeline threw error", err);
     allPassed = false;
   }
 

@@ -1,8 +1,59 @@
 import { GoogleGenAI } from "@google/genai";
+import { createHash } from "node:crypto";
 
 export const MAX_INPUT_CHARS = 30_000;
 export const DEFAULT_MODEL = "gemini-2.5-flash";
-export const API_TIMEOUT_MS = 20_000;
+export const DEFAULT_API_TIMEOUT_MS = 20_000;
+export const VIDEO_API_TIMEOUT_MS = 120_000;
+
+/**
+ * In-memory LRU-like cache (max 100 entries, 10 min TTL).
+ */
+type CacheEntry<T> = {
+  value: T;
+  expiresAt: number;
+};
+
+const cache = new Map<string, CacheEntry<unknown>>();
+const MAX_CACHE_ENTRIES = 100;
+const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+/**
+ * Generates a SHA-256 hash key for caching function calls.
+ */
+export function generateCacheKey(functionName: string, inputs: unknown): string {
+  const serialized = JSON.stringify(inputs);
+  return createHash("sha256").update(`${functionName}:${serialized}`).digest("hex");
+}
+
+/**
+ * Retrieves a cached value if present and not expired.
+ */
+export function getCachedValue<T>(key: string): T | null {
+  const entry = cache.get(key) as CacheEntry<T> | undefined;
+  if (!entry) return null;
+
+  if (Date.now() > entry.expiresAt) {
+    cache.delete(key);
+    return null;
+  }
+
+  return entry.value;
+}
+
+/**
+ * Stores a successful AI result in the in-memory cache.
+ */
+export function setCachedValue<T>(key: string, value: T): void {
+  if (cache.size >= MAX_CACHE_ENTRIES) {
+    const oldestKey = cache.keys().next().value;
+    if (oldestKey) cache.delete(oldestKey);
+  }
+  cache.set(key, {
+    value,
+    expiresAt: Date.now() + CACHE_TTL_MS,
+  });
+}
 
 /**
  * Lazily retrieves the GoogleGenAI client instance or null if API key is not configured.
@@ -22,9 +73,13 @@ export function getGenAIClient(): { client: GoogleGenAI | null; model: string } 
 }
 
 /**
- * Executes an async task with a strict timeout rejection.
+ * Executes an async task with a configurable timeout rejection.
  */
-export async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, operationName: string): Promise<T> {
+export async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number = DEFAULT_API_TIMEOUT_MS,
+  operationName: string = "AI Operation"
+): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   const timeoutPromise = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
