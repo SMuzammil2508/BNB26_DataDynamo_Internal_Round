@@ -8,12 +8,26 @@ export type ClipSuggestion = {
   confidence: number; // 0..1
 };
 
+export type HookOption = {
+  hookText: string;
+  viralScore: number; // 0-100
+  emotionalType: string; // e.g. 'FOMO', 'Curiosity', 'Pattern Interrupt'
+};
+
+export type UppercasePlatform = "TIKTOK" | "REELS" | "YOUTUBE";
+
 export type Platform =
   | "youtube_shorts"
   | "instagram_reels"
   | "tiktok"
   | "x"
   | "linkedin";
+
+export type SinglePlatformAdaptation = {
+  title: string;
+  description: string;
+  hashtags: string[];
+};
 
 export type PlatformAdaptation = {
   platform: Platform;
@@ -98,8 +112,27 @@ export type PipelineInput = {
   platforms?: Platform[];
 };
 
+export type ExecutionSource = "live" | "fallback";
+export type ExecutionProvider = "gemini" | "groq" | "fallback";
+
+export type PipelineSources = {
+  videoAnalysis?: ExecutionSource;
+  generateHooks: ExecutionSource;
+  suggestClips: ExecutionSource;
+  matchScriptToFootage: ExecutionSource;
+  adaptContent: ExecutionSource;
+};
+
+export type PipelineProviders = {
+  videoAnalysis?: ExecutionProvider;
+  generateHooks: ExecutionProvider;
+  suggestClips: ExecutionProvider;
+  matchScriptToFootage: ExecutionProvider;
+  adaptContent: ExecutionProvider;
+};
+
 export type PipelineResult = {
-  hooks: string[];
+  hooks: HookOption[] | string[];
   clips: ClipSuggestion[];
   matches: ScriptFootageMatch[];
   edl: EditDecisionList;
@@ -107,4 +140,6 @@ export type PipelineResult = {
   transcript: string;
   scenes?: VideoScene[];
   warnings: string[];
+  source: PipelineSources;
+  provider: PipelineProviders;
 };

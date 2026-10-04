@@ -1,6 +1,9 @@
 import { Type, type Schema } from "@google/genai";
 import type {
   ClipSuggestion,
+  HookOption,
+  UppercasePlatform,
+  SinglePlatformAdaptation,
   Platform,
   PlatformAdaptation,
   ScriptFootageMatch,
@@ -12,23 +15,32 @@ import type {
   VideoAnalysisInput,
   PipelineInput,
   PipelineResult,
+  ExecutionSource,
+  ExecutionProvider,
+  PipelineProviders,
 } from "./types";
 import {
   getGenAIClient,
   timeToSeconds,
   safeJsonParse,
   withTimeout,
+  executeTextModelChain,
   getFirstSentence,
+  normalizeTranscript,
   generateCacheKey,
+  generateVideoCacheKey,
   getCachedValue,
   setCachedValue,
+  formatShortError,
   MAX_INPUT_CHARS,
-  DEFAULT_API_TIMEOUT_MS,
   VIDEO_API_TIMEOUT_MS,
 } from "./utils";
 
 export type {
   ClipSuggestion,
+  HookOption,
+  UppercasePlatform,
+  SinglePlatformAdaptation,
   Platform,
   PlatformAdaptation,
   ScriptFootageMatch,
@@ -40,24 +52,60 @@ export type {
   VideoAnalysisInput,
   PipelineInput,
   PipelineResult,
+  ExecutionSource,
 };
 
 // ============================================================================
 // Schemas
 // ============================================================================
 
-const hooksResponseSchema: Schema = {
+const structuredHooksResponseSchema: Schema = {
   type: Type.OBJECT,
   properties: {
     hooks: {
       type: Type.ARRAY,
       items: {
-        type: Type.STRING,
+        type: Type.OBJECT,
+        properties: {
+          hookText: {
+            type: Type.STRING,
+            description: "Engaging, scroll-stopping opening hook text (<= 140 chars).",
+          },
+          viralScore: {
+            type: Type.INTEGER,
+            description: "Predicted virality retention score between 0 and 100.",
+          },
+          emotionalType: {
+            type: Type.STRING,
+            description: "Emotional driver: 'FOMO', 'Curiosity', 'Pattern Interrupt', 'Bold Claim', or 'Pain Point'.",
+          },
+        },
+        required: ["hookText", "viralScore", "emotionalType"],
       },
-      description: "Exactly 3 distinct, engaging, scroll-stopping hooks (each <= 140 chars).",
+      description: "Exactly 3 distinct, high-impact hook options.",
     },
   },
   required: ["hooks"],
+};
+
+const singleAdaptContentResponseSchema: Schema = {
+  type: Type.OBJECT,
+  properties: {
+    title: {
+      type: Type.STRING,
+      description: "Platform-optimized punchy title.",
+    },
+    description: {
+      type: Type.STRING,
+      description: "Platform-native caption and description text.",
+    },
+    hashtags: {
+      type: Type.ARRAY,
+      items: { type: Type.STRING },
+      description: "Trending, relevant hashtags for the target platform.",
+    },
+  },
+  required: ["title", "description", "hashtags"],
 };
 
 const clipsResponseSchema: Schema = {
@@ -175,7 +223,7 @@ const videoAnalysisResponseSchema: Schema = {
   properties: {
     transcript: {
       type: Type.STRING,
-      description: "Full timestamped transcript with lines formatted exactly as '[MM:SS] text'.",
+      description: "Full timestamped transcript with lines formatted exactly as '[MM:SS] spoken text'.",
     },
     scenes: {
       type: Type.ARRAY,
@@ -282,23 +330,63 @@ const PLATFORM_SPECS: Record<Platform, PlatformSpec> = {
 // Fallback Generators
 // ============================================================================
 
-function getFallbackHooks(scriptContent: string): string[] {
+function getFallbackHooks(scriptContent: string): HookOption[] {
   const seed = getFirstSentence(scriptContent);
-  const baseHooks = [
-    `Stop scrolling: If you care about ${seed}, you need to hear this right now.`,
-    `Most people get this completely wrong about ${seed}—here is what actually works.`,
-    `Are you struggling with ${seed}? Here is the exact fix in under 60 seconds.`,
+  return [
+    {
+      hookText: `Stop scrolling: If you care about ${seed}, you need to hear this right now.`.slice(0, 140),
+      viralScore: 94,
+      emotionalType: "FOMO",
+    },
+    {
+      hookText: `Most people get this completely wrong about ${seed}—here is what actually works.`.slice(0, 140),
+      viralScore: 91,
+      emotionalType: "Curiosity",
+    },
+    {
+      hookText: `Wait, why is nobody talking about this trick for ${seed}?`.slice(0, 140),
+      viralScore: 88,
+      emotionalType: "Pattern Interrupt",
+    },
   ];
-  return baseHooks.map((h) => (h.length > 140 ? `${h.slice(0, 137)}...` : h));
+}
+
+function getFallbackSingleAdaptation(script: string, platform: UppercasePlatform): SinglePlatformAdaptation {
+  const seed = getFirstSentence(script);
+  const normalized = platform.toUpperCase();
+
+  if (normalized === "TIKTOK") {
+    return {
+      title: `How to master ${seed}`.slice(0, 80),
+      description: `Stop struggling with ${seed}! Here is the exact breakdown in 60s. Drop a comment with your thoughts 👇`,
+      hashtags: ["#fyp", "#creator", "#viral", "#growthtips", "#trending"],
+    };
+  }
+
+  if (normalized === "REELS") {
+    return {
+      title: `The Secret to ${seed}`.slice(0, 80),
+      description: `Save this Reel for later! 📌 Everything you need to know about ${seed} in under 60 seconds.`,
+      hashtags: ["#reelsinstagram", "#creators", "#viralreels", "#businesstips", "#contentstrategy"],
+    };
+  }
+
+  // YOUTUBE
+  return {
+    title: `Do THIS for ${seed} (Complete Guide)`.slice(0, 100),
+    description: `In this video, discover the complete framework for ${seed}. Subscribe for weekly creator strategies and workflows.`,
+    hashtags: ["#Shorts", "#YouTubeShorts", "#ContentCreation", "#ViralStrategy"],
+  };
 }
 
 function getFallbackClips(scriptContent: string, videoTranscript: string): ClipSuggestion[] {
   const seed = getFirstSentence(scriptContent);
+  const normalized = normalizeTranscript(videoTranscript);
   const timestampRegex = /(?:\[|\b)(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)(?:\]|\b)/g;
   const foundTimestamps: string[] = [];
   let match: RegExpExecArray | null;
 
-  while ((match = timestampRegex.exec(videoTranscript)) !== null) {
+  while ((match = timestampRegex.exec(normalized)) !== null) {
     if (!foundTimestamps.includes(match[1])) {
       foundTimestamps.push(match[1]);
     }
@@ -406,6 +494,17 @@ function getFallbackVideoAnalysis(): VideoAnalysis {
 }
 
 // ============================================================================
+// Internal Execution State Tracking
+// ============================================================================
+
+type ExecutionWithStatus<T> = {
+  data: T;
+  source: ExecutionSource;
+  provider: ExecutionProvider;
+  warning?: string;
+};
+
+// ============================================================================
 // Public API Implementations
 // ============================================================================
 
@@ -416,16 +515,30 @@ function getFallbackVideoAnalysis(): VideoAnalysis {
  * @returns A VideoAnalysis object containing timestamped transcript and scene details.
  */
 export async function analyzeVideo(input: VideoAnalysisInput): Promise<VideoAnalysis> {
+  const res = await internalAnalyzeVideo(input);
+  return res.data;
+}
+
+async function internalAnalyzeVideo(input: VideoAnalysisInput): Promise<ExecutionWithStatus<VideoAnalysis>> {
   const { fileUri, filePath, mimeType } = input || {};
   if (!fileUri && !filePath) {
     console.warn("[CreatorAI] analyzeVideo: No fileUri or filePath provided. Returning fallback video analysis.");
-    return getFallbackVideoAnalysis();
+    return { data: getFallbackVideoAnalysis(), source: "fallback", provider: "fallback", warning: "No fileUri or filePath provided for analyzeVideo" };
+  }
+
+  // Check persistent disk cache for video files
+  const videoCacheKey = filePath ? generateVideoCacheKey(filePath) : fileUri ? generateCacheKey("analyzeVideo_v1", fileUri) : null;
+  if (videoCacheKey) {
+    const cached = getCachedValue<VideoAnalysis>(videoCacheKey);
+    if (cached) {
+      return { data: cached.value, source: "live", provider: cached.provider };
+    }
   }
 
   const { client, model } = getGenAIClient();
   if (!client) {
     console.warn("[CreatorAI] analyzeVideo: GEMINI_API_KEY / GOOGLE_API_KEY is not set. Returning fallback video analysis.");
-    return getFallbackVideoAnalysis();
+    return { data: getFallbackVideoAnalysis(), source: "fallback", provider: "fallback", warning: "API key is not configured for analyzeVideo" };
   }
 
   let uploadedFileName: string | undefined;
@@ -438,22 +551,24 @@ export async function analyzeVideo(input: VideoAnalysisInput): Promise<VideoAnal
     if (!targetUri && filePath) {
       const uploadResult = await client.files.upload({
         file: filePath,
-        config: { mimeType: targetMimeType },
-      });
+        mimeType: targetMimeType,
+      } as Parameters<typeof client.files.upload>[0]);
       uploadedFileName = uploadResult.name;
       targetUri = uploadResult.uri;
 
       // Poll until file state is ACTIVE
-      let fileInfo = await client.files.get({ name: uploadResult.name! });
-      let attempts = 0;
-      while (fileInfo.state === "PROCESSING" && attempts < 30) {
-        await new Promise((resolve) => setTimeout(resolve, 2000));
-        fileInfo = await client.files.get({ name: uploadResult.name! });
-        attempts++;
-      }
+      if (uploadResult.name) {
+        let fileInfo = await client.files.get({ name: uploadResult.name });
+        let attempts = 0;
+        while (fileInfo.state === "PROCESSING" && attempts < 30) {
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+          fileInfo = await client.files.get({ name: uploadResult.name });
+          attempts++;
+        }
 
-      if (fileInfo.state !== "ACTIVE") {
-        throw new Error(`Uploaded file failed to activate (state: ${fileInfo.state})`);
+        if (fileInfo.state !== "ACTIVE") {
+          throw new Error(`Uploaded file failed to activate (state: ${fileInfo.state})`);
+        }
       }
     }
 
@@ -511,7 +626,7 @@ export async function analyzeVideo(input: VideoAnalysisInput): Promise<VideoAnal
 
     if (!parsed || typeof parsed.transcript !== "string") {
       console.warn("[CreatorAI] analyzeVideo: Failed to parse valid video analysis JSON from model response.");
-      return getFallbackVideoAnalysis();
+      return { data: getFallbackVideoAnalysis(), source: "fallback", provider: "fallback", warning: "Failed to parse valid video analysis from model" };
     }
 
     const scenes: VideoScene[] = [];
@@ -540,16 +655,26 @@ export async function analyzeVideo(input: VideoAnalysisInput): Promise<VideoAnal
       }
     }
 
-    return {
-      transcript: parsed.transcript.trim(),
+    const normalizedTranscript = normalizeTranscript(parsed.transcript.trim());
+    const resultData: VideoAnalysis = {
+      transcript: normalizedTranscript,
       scenes,
       durationSeconds: parsed.durationSeconds || (scenes[scenes.length - 1]?.endSeconds ?? 0),
     };
+
+    if (videoCacheKey) {
+      setCachedValue(videoCacheKey, resultData, "gemini");
+    }
+
+    return {
+      data: resultData,
+      source: "live",
+      provider: "gemini",
+    };
   } catch (error) {
-    console.warn(
-      `[CreatorAI] analyzeVideo: Video analysis failed (${error instanceof Error ? error.message : "Unknown error"}). Returning fallback.`
-    );
-    return getFallbackVideoAnalysis();
+    const errorMsg = formatShortError(model, error);
+    console.warn(`[CreatorAI] analyzeVideo: Video analysis failed (${errorMsg}). Returning fallback.`);
+    return { data: getFallbackVideoAnalysis(), source: "fallback", provider: "fallback", warning: `analyzeVideo failed: ${errorMsg}` };
   } finally {
     if (uploadedFileName && client) {
       try {
@@ -562,91 +687,109 @@ export async function analyzeVideo(input: VideoAnalysisInput): Promise<VideoAnal
 }
 
 /**
- * Generates exactly 3 distinct, scroll-stopping hook options for short-form video content based on a script.
+ * Generates structured, high-impact hook options containing hookText, viralScore (0-100), and emotionalType.
  *
  * @param scriptContent - The full or partial script text.
- * @returns An array of exactly 3 distinct hook strings (each <= 140 chars).
+ * @returns An array of 3 structured HookOption objects.
  */
-export async function generateHooks(scriptContent: string): Promise<string[]> {
+export async function generateHooks(scriptContent: string): Promise<HookOption[]> {
+  const res = await internalGenerateHooks(scriptContent);
+  return res.data;
+}
+
+async function internalGenerateHooks(scriptContent: string): Promise<ExecutionWithStatus<HookOption[]>> {
   const trimmedInput = (scriptContent ?? "").trim();
   if (!trimmedInput) {
     console.warn("[CreatorAI] generateHooks: Empty or whitespace input provided. Returning fallback hooks.");
-    return getFallbackHooks("");
+    return { data: getFallbackHooks(""), source: "fallback", provider: "fallback", warning: "Empty input provided to generateHooks" };
   }
 
-  const cacheKey = generateCacheKey("generateHooks", trimmedInput);
-  const cached = getCachedValue<string[]>(cacheKey);
-  if (cached) return cached;
-
-  const { client, model } = getGenAIClient();
-  if (!client) {
-    console.warn("[CreatorAI] generateHooks: GEMINI_API_KEY / GOOGLE_API_KEY is not set. Returning fallback hooks.");
-    return getFallbackHooks(trimmedInput);
-  }
+  const cacheKey = generateCacheKey("generateHooks_v3", trimmedInput);
+  const cached = getCachedValue<HookOption[]>(cacheKey);
+  if (cached) return { data: cached.value, source: "live", provider: cached.provider };
 
   const boundedInput = trimmedInput.slice(0, MAX_INPUT_CHARS);
   const systemInstruction =
     "You are an elite short-form content strategist for TikTok, YouTube Shorts, and Instagram Reels. " +
-    "Analyze the provided script and generate EXACTLY 3 distinct, engaging hook options. " +
+    "Analyze the provided script and generate EXACTLY 3 distinct, engaging hook options.\n" +
     "Requirements:\n" +
-    "- Each hook must be strictly <= 140 characters.\n" +
-    "- Use distinct angles across the 3 hooks: (1) Curiosity gap, (2) Bold/controversial claim, (3) Pain-point question.\n" +
-    "- First-line scroll-stopping style designed to maximize retention in the first 3 seconds.\n" +
+    "- hookText: strictly <= 140 characters, first-line scroll-stopping format.\n" +
+    "- viralScore: predicted virality and retention rating as an integer from 0 to 100.\n" +
+    "- emotionalType: psychological driver (e.g. 'FOMO', 'Curiosity', 'Pattern Interrupt', 'Bold Claim', 'Pain Point').\n" +
     "- Return only valid JSON conforming to the requested schema.";
 
-  const prompt = `Script Content:\n"""\n${boundedInput}\n"""\n\nGenerate 3 distinct hooks according to the instructions.`;
+  const prompt = `Script Content:\n"""\n${boundedInput}\n"""\n\nGenerate 3 distinct structured hooks.`;
 
   try {
-    const response = await withTimeout(
-      client.models.generateContent({
-        model,
-        contents: prompt,
-        config: {
-          systemInstruction,
-          responseMimeType: "application/json",
-          responseSchema: hooksResponseSchema,
-        },
-      }),
-      DEFAULT_API_TIMEOUT_MS,
+    const execResult = await executeTextModelChain<HookOption[]>(
+      async (modelName) => {
+        const { client } = getGenAIClient();
+        if (!client) throw new Error("GEMINI_API_KEY not configured");
+        const res = await client.models.generateContent({
+          model: modelName,
+          contents: prompt,
+          config: {
+            systemInstruction,
+            responseMimeType: "application/json",
+            responseSchema: structuredHooksResponseSchema,
+            thinkingConfig: { thinkingBudget: 0 },
+          },
+        });
+        return res.text ?? "";
+      },
+      (rawText) => {
+        const parsed = safeJsonParse<{
+          hooks?: Array<{
+            hookText?: string;
+            viralScore?: number;
+            emotionalType?: string;
+          }>;
+        }>(rawText);
+
+        if (!parsed || !Array.isArray(parsed.hooks)) return null;
+
+        const cleanedHooks: HookOption[] = [];
+        for (const h of parsed.hooks) {
+          if (!h || typeof h !== "object") continue;
+          const hookText = typeof h.hookText === "string" ? h.hookText.trim() : "";
+          if (!hookText) continue;
+
+          const rawScore = typeof h.viralScore === "number" ? Math.round(h.viralScore) : 85;
+          const viralScore = Math.max(0, Math.min(100, rawScore));
+          const emotionalType = typeof h.emotionalType === "string" && h.emotionalType.trim()
+            ? h.emotionalType.trim()
+            : "Curiosity";
+
+          cleanedHooks.push({
+            hookText: hookText.length > 140 ? `${hookText.slice(0, 137)}...` : hookText,
+            viralScore,
+            emotionalType,
+          });
+        }
+
+        if (cleanedHooks.length < 3) {
+          const fallbackList = getFallbackHooks(trimmedInput);
+          for (const fallback of fallbackList) {
+            if (cleanedHooks.length >= 3) break;
+            if (!cleanedHooks.some((item) => item.hookText === fallback.hookText)) {
+              cleanedHooks.push(fallback);
+            }
+          }
+        }
+
+        return cleanedHooks.slice(0, 3);
+      },
+      systemInstruction,
+      prompt,
       "generateHooks"
     );
 
-    const rawText = response.text ?? "";
-    const parsed = safeJsonParse<{ hooks?: string[] }>(rawText);
-
-    if (!parsed || !Array.isArray(parsed.hooks)) {
-      console.warn("[CreatorAI] generateHooks: Failed to parse valid hooks JSON from model response. Returning fallback.");
-      return getFallbackHooks(trimmedInput);
-    }
-
-    const cleanedHooks: string[] = [];
-    for (const hook of parsed.hooks) {
-      if (typeof hook === "string") {
-        const t = hook.trim();
-        if (t.length > 0 && !cleanedHooks.includes(t)) {
-          cleanedHooks.push(t.length > 140 ? `${t.slice(0, 137)}...` : t);
-        }
-      }
-    }
-
-    if (cleanedHooks.length < 3) {
-      const fallbackList = getFallbackHooks(trimmedInput);
-      for (const fallback of fallbackList) {
-        if (cleanedHooks.length >= 3) break;
-        if (!cleanedHooks.includes(fallback)) {
-          cleanedHooks.push(fallback);
-        }
-      }
-    }
-
-    const result = cleanedHooks.slice(0, 3);
-    setCachedValue(cacheKey, result);
-    return result;
+    setCachedValue(cacheKey, execResult.data, execResult.provider);
+    return { data: execResult.data, source: "live", provider: execResult.provider };
   } catch (error) {
-    console.warn(
-      `[CreatorAI] generateHooks: API call failed or encountered an error (${error instanceof Error ? error.message : "Unknown error"}). Returning fallback.`
-    );
-    return getFallbackHooks(trimmedInput);
+    const errorMsg = error instanceof Error ? error.message : "Unknown error";
+    console.warn(`[CreatorAI] generateHooks: All providers failed (${errorMsg}). Returning fallback.`);
+    return { data: getFallbackHooks(trimmedInput), source: "fallback", provider: "fallback", warning: `generateHooks failed: ${errorMsg}` };
   }
 }
 
@@ -661,36 +804,36 @@ export async function suggestClips(
   scriptContent: string,
   videoTranscript: string
 ): Promise<ClipSuggestion[]> {
+  const res = await internalSuggestClips(scriptContent, videoTranscript);
+  return res.data;
+}
+
+async function internalSuggestClips(
+  scriptContent: string,
+  videoTranscript: string
+): Promise<ExecutionWithStatus<ClipSuggestion[]>> {
   const trimmedScript = (scriptContent ?? "").trim();
-  const trimmedTranscript = (videoTranscript ?? "").trim();
+  const normalizedTranscript = normalizeTranscript(videoTranscript ?? "");
 
-  if (!trimmedScript && !trimmedTranscript) {
+  if (!trimmedScript && !normalizedTranscript) {
     console.warn("[CreatorAI] suggestClips: Empty script and transcript provided. Returning fallback clips.");
-    return getFallbackClips("", "");
+    return { data: getFallbackClips("", ""), source: "fallback", provider: "fallback", warning: "Empty input to suggestClips" };
   }
 
-  const cacheKey = generateCacheKey("suggestClips", { trimmedScript, trimmedTranscript });
+  const cacheKey = generateCacheKey("suggestClips_v3", { trimmedScript, normalizedTranscript });
   const cached = getCachedValue<ClipSuggestion[]>(cacheKey);
-  if (cached) return cached;
-
-  const { client, model } = getGenAIClient();
-  if (!client) {
-    console.warn("[CreatorAI] suggestClips: GEMINI_API_KEY / GOOGLE_API_KEY is not set. Returning fallback clips.");
-    return getFallbackClips(trimmedScript, trimmedTranscript);
-  }
+  if (cached) return { data: cached.value, source: "live", provider: cached.provider };
 
   const boundedScript = trimmedScript.slice(0, MAX_INPUT_CHARS);
-  const boundedTranscript = trimmedTranscript.slice(0, MAX_INPUT_CHARS);
+  const boundedTranscript = normalizedTranscript.slice(0, MAX_INPUT_CHARS);
 
   const systemInstruction =
     "You are an expert viral video editor and content strategist. " +
     "Compare the provided script against the timestamped transcript and identify 3 to 5 high-performing short-form clips (15 to 60 seconds each).\n" +
     "Requirements:\n" +
-    "- Timestamps (startTime and endTime) MUST exist in the provided transcript. NEVER invent timestamps.\n" +
-    "- Each clip must be a self-contained segment with a strong opening hook and a clean, satisfying ending.\n" +
-    "- Prioritize parts that align with key script beats and deliver high standalone value.\n" +
-    "- Confidence score must be a number between 0 and 1.\n" +
-    "- Sort recommendations by confidence descending.\n" +
+    "- Timestamps (startTime and endTime) MUST correspond to cues in the provided transcript.\n" +
+    "- Each clip must be a self-contained segment with a strong opening hook and clean ending.\n" +
+    "- Prioritize parts that align with key script beats.\n" +
     "- Return only valid JSON conforming to the requested schema.";
 
   const prompt =
@@ -699,114 +842,193 @@ export async function suggestClips(
     "Identify 3-5 optimal short-form clips according to the instructions.";
 
   try {
-    const response = await withTimeout(
-      client.models.generateContent({
-        model,
-        contents: prompt,
-        config: {
-          systemInstruction,
-          responseMimeType: "application/json",
-          responseSchema: clipsResponseSchema,
-        },
-      }),
-      DEFAULT_API_TIMEOUT_MS,
+    const execResult = await executeTextModelChain<ClipSuggestion[]>(
+      async (modelName) => {
+        const { client } = getGenAIClient();
+        if (!client) throw new Error("GEMINI_API_KEY not configured");
+        const res = await client.models.generateContent({
+          model: modelName,
+          contents: prompt,
+          config: {
+            systemInstruction,
+            responseMimeType: "application/json",
+            responseSchema: clipsResponseSchema,
+            thinkingConfig: { thinkingBudget: 0 },
+          },
+        });
+        return res.text ?? "";
+      },
+      (rawText) => {
+        const parsed = safeJsonParse<{
+          clips?: Array<{
+            startTime?: string;
+            endTime?: string;
+            title?: string;
+            reason?: string;
+            confidence?: number;
+          }>;
+        }>(rawText);
+
+        if (!parsed || !Array.isArray(parsed.clips)) return null;
+
+        const validatedClips: ClipSuggestion[] = [];
+        for (const item of parsed.clips) {
+          if (!item || typeof item !== "object") continue;
+
+          const startTime = typeof item.startTime === "string" ? item.startTime.trim() : "";
+          const endTime = typeof item.endTime === "string" ? item.endTime.trim() : "";
+          const title = typeof item.title === "string" && item.title.trim() ? item.title.trim() : "Untitled Clip";
+          const reason = typeof item.reason === "string" && item.reason.trim() ? item.reason.trim() : "Highlight segment.";
+
+          const startSeconds = timeToSeconds(startTime);
+          const endSeconds = timeToSeconds(endTime);
+
+          if (Number.isNaN(startSeconds) || Number.isNaN(endSeconds)) continue;
+          if (endSeconds <= startSeconds) continue;
+
+          const duration = endSeconds - startSeconds;
+          if (duration < 5 || duration > 90) continue;
+
+          const rawConfidence = typeof item.confidence === "number" ? item.confidence : 0.7;
+          const confidence = Math.max(0, Math.min(1, Number(rawConfidence.toFixed(2))));
+
+          validatedClips.push({
+            startTime,
+            endTime,
+            startSeconds,
+            endSeconds,
+            title,
+            reason,
+            confidence,
+          });
+        }
+
+        if (validatedClips.length === 0) return null;
+
+        validatedClips.sort((a, b) => b.confidence - a.confidence);
+        return validatedClips.slice(0, 5);
+      },
+      systemInstruction,
+      prompt,
       "suggestClips"
     );
 
-    const rawText = response.text ?? "";
-    const parsed = safeJsonParse<{
-      clips?: Array<{
-        startTime?: string;
-        endTime?: string;
-        title?: string;
-        reason?: string;
-        confidence?: number;
-      }>;
-    }>(rawText);
-
-    if (!parsed || !Array.isArray(parsed.clips)) {
-      console.warn("[CreatorAI] suggestClips: Failed to parse valid clips JSON from model response. Returning fallback.");
-      return getFallbackClips(trimmedScript, trimmedTranscript);
-    }
-
-    const validatedClips: ClipSuggestion[] = [];
-
-    for (const item of parsed.clips) {
-      if (!item || typeof item !== "object") continue;
-
-      const startTime = typeof item.startTime === "string" ? item.startTime.trim() : "";
-      const endTime = typeof item.endTime === "string" ? item.endTime.trim() : "";
-      const title = typeof item.title === "string" && item.title.trim() ? item.title.trim() : "Untitled Clip";
-      const reason = typeof item.reason === "string" && item.reason.trim() ? item.reason.trim() : "Highlight segment.";
-
-      const startSeconds = timeToSeconds(startTime);
-      const endSeconds = timeToSeconds(endTime);
-
-      if (Number.isNaN(startSeconds) || Number.isNaN(endSeconds)) continue;
-      if (endSeconds <= startSeconds) continue;
-
-      const duration = endSeconds - startSeconds;
-      if (duration < 5 || duration > 90) continue;
-
-      const rawConfidence = typeof item.confidence === "number" ? item.confidence : 0.7;
-      const confidence = Math.max(0, Math.min(1, Number(rawConfidence.toFixed(2))));
-
-      validatedClips.push({
-        startTime,
-        endTime,
-        startSeconds,
-        endSeconds,
-        title,
-        reason,
-        confidence,
-      });
-    }
-
-    if (validatedClips.length === 0) {
-      console.warn("[CreatorAI] suggestClips: No valid clips passed timestamp/duration validation. Returning fallback.");
-      return getFallbackClips(trimmedScript, trimmedTranscript);
-    }
-
-    validatedClips.sort((a, b) => b.confidence - a.confidence);
-    const result = validatedClips.slice(0, 5);
-    setCachedValue(cacheKey, result);
-    return result;
+    setCachedValue(cacheKey, execResult.data, execResult.provider);
+    return { data: execResult.data, source: "live", provider: execResult.provider };
   } catch (error) {
-    console.warn(
-      `[CreatorAI] suggestClips: API call failed or encountered an error (${error instanceof Error ? error.message : "Unknown error"}). Returning fallback.`
-    );
-    return getFallbackClips(trimmedScript, trimmedTranscript);
+    const errorMsg = error instanceof Error ? error.message : "Unknown error";
+    console.warn(`[CreatorAI] suggestClips: All providers failed (${errorMsg}). Returning fallback.`);
+    return { data: getFallbackClips(trimmedScript, normalizedTranscript), source: "fallback", provider: "fallback", warning: `suggestClips failed: ${errorMsg}` };
   }
 }
 
-/**
- * Adapts script content across specified social media platforms, enforcing platform-specific formatting and length limits.
- *
- * @param scriptContent - Base script or content draft.
- * @param platforms - Array of target platforms.
- * @returns An array of PlatformAdaptation objects tailored and clamped to each platform's rules.
- */
+// Function signature overloads for adaptContent
+export async function adaptContent(
+  script: string,
+  platform: UppercasePlatform
+): Promise<SinglePlatformAdaptation>;
 export async function adaptContent(
   scriptContent: string,
   platforms: Platform[]
-): Promise<PlatformAdaptation[]> {
-  const targetPlatforms: Platform[] = Array.isArray(platforms) && platforms.length > 0 ? platforms : ["youtube_shorts"];
+): Promise<PlatformAdaptation[]>;
+
+/**
+ * Adapts script content across specified social media platforms or single uppercase platform targets.
+ */
+export async function adaptContent(
+  scriptContent: string,
+  platformOrPlatforms: Platform[] | UppercasePlatform
+): Promise<PlatformAdaptation[] | SinglePlatformAdaptation> {
+  const res = await internalAdaptContent(scriptContent, platformOrPlatforms);
+  return res.data;
+}
+
+async function internalAdaptContent(
+  scriptContent: string,
+  platformOrPlatforms: Platform[] | UppercasePlatform
+): Promise<ExecutionWithStatus<PlatformAdaptation[] | SinglePlatformAdaptation>> {
   const trimmedInput = (scriptContent ?? "").trim();
+
+  // Case 1: Single Uppercase Platform ('TIKTOK' | 'REELS' | 'YOUTUBE')
+  if (typeof platformOrPlatforms === "string") {
+    const singlePlatform = platformOrPlatforms.toUpperCase() as UppercasePlatform;
+    if (!trimmedInput) {
+      console.warn(`[CreatorAI] adaptContent: Empty script provided for ${singlePlatform}. Returning fallback.`);
+      return { data: getFallbackSingleAdaptation("", singlePlatform), source: "fallback", provider: "fallback", warning: `Empty script provided for ${singlePlatform}` };
+    }
+
+    const cacheKey = generateCacheKey("adaptContent_single_v3", { trimmedInput, singlePlatform });
+    const cached = getCachedValue<SinglePlatformAdaptation>(cacheKey);
+    if (cached) return { data: cached.value, source: "live", provider: cached.provider };
+
+    const boundedInput = trimmedInput.slice(0, MAX_INPUT_CHARS);
+    const systemInstruction =
+      `You are a viral social media strategist specializing in ${singlePlatform}. ` +
+      `Generate a platform-optimized title, description/caption, and 3-5 high-performing trending hashtags.\n` +
+      `Return only valid JSON matching the schema.`;
+
+    const prompt = `Script Content:\n"""\n${boundedInput}\n"""\n\nGenerate optimized title, description, and hashtags for ${singlePlatform}.`;
+
+    try {
+      const execResult = await executeTextModelChain<SinglePlatformAdaptation>(
+        async (modelName) => {
+          const { client } = getGenAIClient();
+          if (!client) throw new Error("GEMINI_API_KEY not configured");
+          const res = await client.models.generateContent({
+            model: modelName,
+            contents: prompt,
+            config: {
+              systemInstruction,
+              responseMimeType: "application/json",
+              responseSchema: singleAdaptContentResponseSchema,
+              thinkingConfig: { thinkingBudget: 0 },
+            },
+          });
+          return res.text ?? "";
+        },
+        (rawText) => {
+          const parsed = safeJsonParse<SinglePlatformAdaptation>(rawText);
+          if (!parsed || !parsed.title || !parsed.description) return null;
+
+          const hashtags = Array.isArray(parsed.hashtags)
+            ? parsed.hashtags
+                .filter((h): h is string => typeof h === "string" && h.trim().length > 0)
+                .map((h) => (h.startsWith("#") ? h.trim() : `#${h.trim()}`))
+            : ["#viral", "#content", "#growth"];
+
+          return {
+            title: parsed.title.trim(),
+            description: parsed.description.trim(),
+            hashtags: hashtags.length > 0 ? hashtags : ["#viral", "#content"],
+          };
+        },
+        systemInstruction,
+        prompt,
+        `adaptContent_${singlePlatform}`
+      );
+
+      setCachedValue(cacheKey, execResult.data, execResult.provider);
+      return { data: execResult.data, source: "live", provider: execResult.provider };
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : "Unknown error";
+      console.warn(`[CreatorAI] adaptContent: All providers failed for ${singlePlatform} (${errorMsg}). Returning fallback.`);
+      return { data: getFallbackSingleAdaptation(trimmedInput, singlePlatform), source: "fallback", provider: "fallback", warning: `adaptContent (${singlePlatform}) failed: ${errorMsg}` };
+    }
+  }
+
+  // Case 2: Array of lowercase Platforms
+  const targetPlatforms: Platform[] = Array.isArray(platformOrPlatforms) && platformOrPlatforms.length > 0
+    ? platformOrPlatforms
+    : (["youtube_shorts"] as Platform[]);
 
   if (!trimmedInput) {
     console.warn("[CreatorAI] adaptContent: Empty script input provided. Returning fallback adaptations.");
-    return getFallbackAdaptations("", targetPlatforms);
+    return { data: getFallbackAdaptations("", targetPlatforms), source: "fallback", provider: "fallback", warning: "Empty script input to adaptContent" };
   }
 
-  const cacheKey = generateCacheKey("adaptContent", { trimmedInput, targetPlatforms });
+  const cacheKey = generateCacheKey("adaptContent_multi_v3", { trimmedInput, targetPlatforms });
   const cached = getCachedValue<PlatformAdaptation[]>(cacheKey);
-  if (cached) return cached;
-
-  const { client, model } = getGenAIClient();
-  if (!client) {
-    console.warn("[CreatorAI] adaptContent: GEMINI_API_KEY / GOOGLE_API_KEY is not set. Returning fallback adaptations.");
-    return getFallbackAdaptations(trimmedInput, targetPlatforms);
-  }
+  if (cached) return { data: cached.value, source: "live", provider: cached.provider };
 
   const boundedInput = trimmedInput.slice(0, MAX_INPUT_CHARS);
   const systemInstruction =
@@ -817,85 +1039,96 @@ export async function adaptContent(
   const prompt = `Platforms to adapt for: ${targetPlatforms.join(", ")}\n\nContent:\n"""\n${boundedInput}\n"""`;
 
   try {
-    const response = await withTimeout(
-      client.models.generateContent({
-        model,
-        contents: prompt,
-        config: {
-          systemInstruction,
-          responseMimeType: "application/json",
-          responseSchema: adaptContentResponseSchema,
-        },
-      }),
-      DEFAULT_API_TIMEOUT_MS,
-      "adaptContent"
+    const execResult = await executeTextModelChain<PlatformAdaptation[]>(
+      async (modelName) => {
+        const { client } = getGenAIClient();
+        if (!client) throw new Error("GEMINI_API_KEY not configured");
+        const res = await client.models.generateContent({
+          model: modelName,
+          contents: prompt,
+          config: {
+            systemInstruction,
+            responseMimeType: "application/json",
+            responseSchema: adaptContentResponseSchema,
+            thinkingConfig: { thinkingBudget: 0 },
+          },
+        });
+        return res.text ?? "";
+      },
+      (rawText) => {
+        const parsed = safeJsonParse<{
+          adaptations?: Array<{
+            platform?: string;
+            caption?: string;
+            hashtags?: string[];
+            hook?: string;
+            postingTip?: string;
+          }>;
+        }>(rawText);
+
+        const rawAdaptations = parsed?.adaptations ?? [];
+        if (!Array.isArray(rawAdaptations) || rawAdaptations.length === 0) return null;
+
+        const resultMap = new Map<Platform, PlatformAdaptation>();
+
+        for (const raw of rawAdaptations) {
+          const platformKey = (raw.platform ?? "").toLowerCase() as Platform;
+          if (!targetPlatforms.includes(platformKey)) continue;
+
+          const spec = PLATFORM_SPECS[platformKey] ?? PLATFORM_SPECS.youtube_shorts;
+          const rawCaption = typeof raw.caption === "string" ? raw.caption.trim() : "";
+          const caption = rawCaption.slice(0, spec.maxCaptionChars) || `Content update for ${platformKey}.`;
+
+          const rawHashtags = Array.isArray(raw.hashtags) ? raw.hashtags : [];
+          const hashtags = rawHashtags
+            .filter((h): h is string => typeof h === "string" && h.trim().length > 0)
+            .map((h) => (h.startsWith("#") ? h.trim() : `#${h.trim()}`))
+            .slice(0, spec.maxHashtags);
+
+          const rawHook = typeof raw.hook === "string" ? raw.hook.trim() : "";
+          const hook = (rawHook || getFirstSentence(trimmedInput)).slice(0, 140);
+
+          const postingTip = typeof raw.postingTip === "string" && raw.postingTip.trim()
+            ? raw.postingTip.trim()
+            : spec.defaultTip;
+
+          resultMap.set(platformKey, {
+            platform: platformKey,
+            caption,
+            hashtags: hashtags.length > 0 ? hashtags : ["#CreatorAI"],
+            hook,
+            aspectRatio: spec.aspectRatio,
+            maxDurationSeconds: spec.maxDurationSeconds,
+            postingTip,
+          });
+        }
+
+        const finalAdaptations: PlatformAdaptation[] = [];
+        const fallbackList = getFallbackAdaptations(trimmedInput, targetPlatforms);
+
+        for (const platform of targetPlatforms) {
+          const match = resultMap.get(platform);
+          if (match) {
+            finalAdaptations.push(match);
+          } else {
+            const fb = fallbackList.find((f) => f.platform === platform) ?? fallbackList[0];
+            finalAdaptations.push(fb);
+          }
+        }
+
+        return finalAdaptations;
+      },
+      systemInstruction,
+      prompt,
+      "adaptContent_multi"
     );
 
-    const rawText = response.text ?? "";
-    const parsed = safeJsonParse<{
-      adaptations?: Array<{
-        platform?: string;
-        caption?: string;
-        hashtags?: string[];
-        hook?: string;
-        postingTip?: string;
-      }>;
-    }>(rawText);
-
-    const rawAdaptations = parsed?.adaptations ?? [];
-    const resultMap = new Map<Platform, PlatformAdaptation>();
-
-    for (const raw of rawAdaptations) {
-      const platformKey = (raw.platform ?? "").toLowerCase() as Platform;
-      if (!targetPlatforms.includes(platformKey)) continue;
-
-      const spec = PLATFORM_SPECS[platformKey] ?? PLATFORM_SPECS.youtube_shorts;
-      const rawCaption = typeof raw.caption === "string" ? raw.caption.trim() : "";
-      const caption = rawCaption.slice(0, spec.maxCaptionChars) || `Content update for ${platformKey}.`;
-
-      const rawHashtags = Array.isArray(raw.hashtags) ? raw.hashtags : [];
-      const hashtags = rawHashtags
-        .filter((h): h is string => typeof h === "string" && h.trim().length > 0)
-        .map((h) => (h.startsWith("#") ? h.trim() : `#${h.trim()}`))
-        .slice(0, spec.maxHashtags);
-
-      const rawHook = typeof raw.hook === "string" ? raw.hook.trim() : "";
-      const hook = (rawHook || getFirstSentence(trimmedInput)).slice(0, 140);
-
-      const postingTip = typeof raw.postingTip === "string" && raw.postingTip.trim()
-        ? raw.postingTip.trim()
-        : spec.defaultTip;
-
-      resultMap.set(platformKey, {
-        platform: platformKey,
-        caption,
-        hashtags: hashtags.length > 0 ? hashtags : ["#CreatorAI"],
-        hook,
-        aspectRatio: spec.aspectRatio,
-        maxDurationSeconds: spec.maxDurationSeconds,
-        postingTip,
-      });
-    }
-
-    const finalAdaptations: PlatformAdaptation[] = [];
-    const fallbackList = getFallbackAdaptations(trimmedInput, targetPlatforms);
-
-    for (const platform of targetPlatforms) {
-      if (resultMap.has(platform)) {
-        finalAdaptations.push(resultMap.get(platform)!);
-      } else {
-        const fb = fallbackList.find((f) => f.platform === platform) ?? fallbackList[0];
-        finalAdaptations.push(fb);
-      }
-    }
-
-    setCachedValue(cacheKey, finalAdaptations);
-    return finalAdaptations;
+    setCachedValue(cacheKey, execResult.data, execResult.provider);
+    return { data: execResult.data, source: "live", provider: execResult.provider };
   } catch (error) {
-    console.warn(
-      `[CreatorAI] adaptContent: API call failed (${error instanceof Error ? error.message : "Unknown error"}). Returning fallback.`
-    );
-    return getFallbackAdaptations(trimmedInput, targetPlatforms);
+    const errorMsg = error instanceof Error ? error.message : "Unknown error";
+    console.warn(`[CreatorAI] adaptContent: All providers failed (${errorMsg}). Returning fallback.`);
+    return { data: getFallbackAdaptations(trimmedInput, targetPlatforms), source: "fallback", provider: "fallback", warning: `adaptContent failed: ${errorMsg}` };
   }
 }
 
@@ -910,111 +1143,126 @@ export async function matchScriptToFootage(
   scriptContent: string,
   videoTranscript: string
 ): Promise<ScriptFootageMatch[]> {
+  const res = await internalMatchScriptToFootage(scriptContent, videoTranscript);
+  return res.data;
+}
+
+async function internalMatchScriptToFootage(
+  scriptContent: string,
+  videoTranscript: string
+): Promise<ExecutionWithStatus<ScriptFootageMatch[]>> {
   const trimmedScript = (scriptContent ?? "").trim();
-  const trimmedTranscript = (videoTranscript ?? "").trim();
+  const normalizedTranscript = normalizeTranscript(videoTranscript ?? "");
 
-  if (!trimmedScript || !trimmedTranscript) {
+  if (!trimmedScript || !normalizedTranscript) {
     console.warn("[CreatorAI] matchScriptToFootage: Missing script or transcript. Returning fallback matches.");
-    return getFallbackMatches(trimmedScript, trimmedTranscript);
+    return { data: getFallbackMatches(trimmedScript, normalizedTranscript), source: "fallback", provider: "fallback", warning: "Missing script or transcript in matchScriptToFootage" };
   }
 
-  const cacheKey = generateCacheKey("matchScriptToFootage", { trimmedScript, trimmedTranscript });
+  const cacheKey = generateCacheKey("matchScriptToFootage_v3", { trimmedScript, normalizedTranscript });
   const cached = getCachedValue<ScriptFootageMatch[]>(cacheKey);
-  if (cached) return cached;
+  if (cached) return { data: cached.value, source: "live", provider: cached.provider };
 
-  const { client, model } = getGenAIClient();
-  if (!client) {
-    console.warn("[CreatorAI] matchScriptToFootage: GEMINI_API_KEY / GOOGLE_API_KEY is not set. Returning fallback matches.");
-    return getFallbackMatches(trimmedScript, trimmedTranscript);
+  // Calculate maximum transcript time for permissive matching
+  const timestampRegex = /(?:\[|\b)(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)(?:\]|\b)/g;
+  let maxTimeSeconds = 0;
+  let tMatch: RegExpExecArray | null;
+  while ((tMatch = timestampRegex.exec(normalizedTranscript)) !== null) {
+    const s = timeToSeconds(tMatch[1]);
+    if (!Number.isNaN(s) && s > maxTimeSeconds) {
+      maxTimeSeconds = s;
+    }
   }
+  const maxAllowedSeconds = maxTimeSeconds > 0 ? maxTimeSeconds + 15 : 3600;
 
   const boundedScript = trimmedScript.slice(0, MAX_INPUT_CHARS);
-  const boundedTranscript = trimmedTranscript.slice(0, MAX_INPUT_CHARS);
+  const boundedTranscript = normalizedTranscript.slice(0, MAX_INPUT_CHARS);
 
   const systemInstruction =
-    "You are a professional video sync assistant. Match core script beats to corresponding timeline timestamps in the transcript.\n" +
+    "You are a professional video sync assistant. Match core script narrative beats to corresponding timeline timestamps in the transcript.\n" +
     "Requirements:\n" +
-    "- startTime and endTime MUST exist in the transcript.\n" +
+    "- startTime and endTime MUST correspond to the transcript timeline cues.\n" +
     "- matchScore must be a confidence number between 0 and 1.\n" +
     "- Return only valid JSON conforming to the requested schema.";
 
   const prompt = `Script:\n"""\n${boundedScript}\n"""\n\nTranscript:\n"""\n${boundedTranscript}\n"""`;
 
   try {
-    const response = await withTimeout(
-      client.models.generateContent({
-        model,
-        contents: prompt,
-        config: {
-          systemInstruction,
-          responseMimeType: "application/json",
-          responseSchema: matchScriptResponseSchema,
-        },
-      }),
-      DEFAULT_API_TIMEOUT_MS,
+    const execResult = await executeTextModelChain<ScriptFootageMatch[]>(
+      async (modelName) => {
+        const { client } = getGenAIClient();
+        if (!client) throw new Error("GEMINI_API_KEY not configured");
+        const res = await client.models.generateContent({
+          model: modelName,
+          contents: prompt,
+          config: {
+            systemInstruction,
+            responseMimeType: "application/json",
+            responseSchema: matchScriptResponseSchema,
+            thinkingConfig: { thinkingBudget: 0 },
+          },
+        });
+        return res.text ?? "";
+      },
+      (rawText) => {
+        const parsed = safeJsonParse<{
+          matches?: Array<{
+            scriptBeat?: string;
+            startTime?: string;
+            endTime?: string;
+            matchScore?: number;
+            note?: string;
+          }>;
+        }>(rawText);
+
+        if (!parsed || !Array.isArray(parsed.matches)) return null;
+
+        const validatedMatches: ScriptFootageMatch[] = [];
+        for (const item of parsed.matches) {
+          if (!item || typeof item !== "object") continue;
+
+          const scriptBeat = typeof item.scriptBeat === "string" && item.scriptBeat.trim()
+            ? item.scriptBeat.trim()
+            : "Script Beat";
+          const startTime = typeof item.startTime === "string" ? item.startTime.trim() : "";
+          const endTime = typeof item.endTime === "string" ? item.endTime.trim() : "";
+          const note = typeof item.note === "string" && item.note.trim() ? item.note.trim() : "Footage match.";
+
+          const startSeconds = timeToSeconds(startTime);
+          const endSeconds = timeToSeconds(endTime);
+
+          if (Number.isNaN(startSeconds) || Number.isNaN(endSeconds)) continue;
+          if (endSeconds <= startSeconds) continue;
+          if (startSeconds > maxAllowedSeconds) continue;
+
+          const rawScore = typeof item.matchScore === "number" ? item.matchScore : 0.8;
+          const matchScore = Math.max(0, Math.min(1, Number(rawScore.toFixed(2))));
+
+          validatedMatches.push({
+            scriptBeat,
+            startTime,
+            endTime,
+            startSeconds,
+            endSeconds,
+            matchScore,
+            note,
+          });
+        }
+
+        if (validatedMatches.length === 0) return null;
+        return validatedMatches;
+      },
+      systemInstruction,
+      prompt,
       "matchScriptToFootage"
     );
 
-    const rawText = response.text ?? "";
-    const parsed = safeJsonParse<{
-      matches?: Array<{
-        scriptBeat?: string;
-        startTime?: string;
-        endTime?: string;
-        matchScore?: number;
-        note?: string;
-      }>;
-    }>(rawText);
-
-    if (!parsed || !Array.isArray(parsed.matches)) {
-      console.warn("[CreatorAI] matchScriptToFootage: Invalid JSON output from model. Returning fallback matches.");
-      return getFallbackMatches(trimmedScript, trimmedTranscript);
-    }
-
-    const validatedMatches: ScriptFootageMatch[] = [];
-
-    for (const item of parsed.matches) {
-      if (!item || typeof item !== "object") continue;
-
-      const scriptBeat = typeof item.scriptBeat === "string" && item.scriptBeat.trim()
-        ? item.scriptBeat.trim()
-        : "Script Beat";
-      const startTime = typeof item.startTime === "string" ? item.startTime.trim() : "";
-      const endTime = typeof item.endTime === "string" ? item.endTime.trim() : "";
-      const note = typeof item.note === "string" && item.note.trim() ? item.note.trim() : "Footage match.";
-
-      const startSeconds = timeToSeconds(startTime);
-      const endSeconds = timeToSeconds(endTime);
-
-      if (Number.isNaN(startSeconds) || Number.isNaN(endSeconds)) continue;
-      if (endSeconds <= startSeconds) continue;
-
-      const rawScore = typeof item.matchScore === "number" ? item.matchScore : 0.8;
-      const matchScore = Math.max(0, Math.min(1, Number(rawScore.toFixed(2))));
-
-      validatedMatches.push({
-        scriptBeat,
-        startTime,
-        endTime,
-        startSeconds,
-        endSeconds,
-        matchScore,
-        note,
-      });
-    }
-
-    if (validatedMatches.length === 0) {
-      console.warn("[CreatorAI] matchScriptToFootage: No valid matches passed timestamp validation. Returning fallback.");
-      return getFallbackMatches(trimmedScript, trimmedTranscript);
-    }
-
-    setCachedValue(cacheKey, validatedMatches);
-    return validatedMatches;
+    setCachedValue(cacheKey, execResult.data, execResult.provider);
+    return { data: execResult.data, source: "live", provider: execResult.provider };
   } catch (error) {
-    console.warn(
-      `[CreatorAI] matchScriptToFootage: API call failed (${error instanceof Error ? error.message : "Unknown error"}). Returning fallback.`
-    );
-    return getFallbackMatches(trimmedScript, trimmedTranscript);
+    const errorMsg = error instanceof Error ? error.message : "Unknown error";
+    console.warn(`[CreatorAI] matchScriptToFootage: All providers failed (${errorMsg}). Returning fallback.`);
+    return { data: getFallbackMatches(trimmedScript, normalizedTranscript), source: "fallback", provider: "fallback", warning: `matchScriptToFootage failed: ${errorMsg}` };
   }
 }
 
@@ -1125,7 +1373,7 @@ export async function generateCreatorInsights(stats: ContentStat[]): Promise<Cre
   ];
   const defaultWindow = "2:00 PM - 5:00 PM (peak audience activity)";
 
-  const { client, model } = getGenAIClient();
+  const { client } = getGenAIClient();
   if (!client) {
     console.warn("[CreatorAI] generateCreatorInsights: GEMINI_API_KEY / GOOGLE_API_KEY is not set. Returning locally computed insights.");
     return {
@@ -1137,52 +1385,55 @@ export async function generateCreatorInsights(stats: ContentStat[]): Promise<Cre
     };
   }
 
+  const systemInstruction =
+    "You are a creator economy analytics specialist. Analyze the provided metrics and deliver a high-impact narrative summary, patterns, and recommendations. Return only valid JSON conforming to the schema.";
+
   const prompt = `Content Performance Data:\n${JSON.stringify(safeStats.slice(0, 30), null, 2)}\n\nGenerate strategic creator insights based on these metrics.`;
 
   try {
-    const response = await withTimeout(
-      client.models.generateContent({
-        model,
-        contents: prompt,
-        config: {
-          systemInstruction:
-            "You are a creator economy analytics specialist. Analyze the provided metrics and deliver a high-impact narrative summary, patterns, and recommendations. Return only valid JSON conforming to the schema.",
-          responseMimeType: "application/json",
-          responseSchema: insightsNarrativeSchema,
-        },
-      }),
-      DEFAULT_API_TIMEOUT_MS,
+    const execResult = await executeTextModelChain<CreatorInsights>(
+      async (modelName) => {
+        const { client } = getGenAIClient();
+        if (!client) throw new Error("GEMINI_API_KEY not configured");
+        const res = await client.models.generateContent({
+          model: modelName,
+          contents: prompt,
+          config: {
+            systemInstruction,
+            responseMimeType: "application/json",
+            responseSchema: insightsNarrativeSchema,
+            thinkingConfig: { thinkingBudget: 0 },
+          },
+        });
+        return res.text ?? "";
+      },
+      (rawText) => {
+        const parsed = safeJsonParse<{
+          summary?: string;
+          patterns?: string[];
+          recommendations?: string[];
+          bestPostingWindow?: string;
+        }>(rawText);
+
+        if (!parsed || typeof parsed.summary !== "string") return null;
+
+        return {
+          summary: parsed.summary.trim() || heuristicSummary,
+          topPerformers,
+          patterns: Array.isArray(parsed.patterns) && parsed.patterns.length > 0 ? parsed.patterns : heuristicPatterns,
+          recommendations: Array.isArray(parsed.recommendations) && parsed.recommendations.length > 0 ? parsed.recommendations : heuristicRecs,
+          bestPostingWindow: parsed.bestPostingWindow?.trim() || defaultWindow,
+        };
+      },
+      systemInstruction,
+      prompt,
       "generateCreatorInsights"
     );
 
-    const rawText = response.text ?? "";
-    const parsed = safeJsonParse<{
-      summary?: string;
-      patterns?: string[];
-      recommendations?: string[];
-      bestPostingWindow?: string;
-    }>(rawText);
-
-    if (!parsed || typeof parsed.summary !== "string") {
-      return {
-        summary: heuristicSummary,
-        topPerformers,
-        patterns: heuristicPatterns,
-        recommendations: heuristicRecs,
-        bestPostingWindow: defaultWindow,
-      };
-    }
-
-    return {
-      summary: parsed.summary.trim() || heuristicSummary,
-      topPerformers,
-      patterns: Array.isArray(parsed.patterns) && parsed.patterns.length > 0 ? parsed.patterns : heuristicPatterns,
-      recommendations: Array.isArray(parsed.recommendations) && parsed.recommendations.length > 0 ? parsed.recommendations : heuristicRecs,
-      bestPostingWindow: parsed.bestPostingWindow?.trim() || defaultWindow,
-    };
+    return execResult.data;
   } catch (error) {
     console.warn(
-      `[CreatorAI] generateCreatorInsights: API call failed (${error instanceof Error ? error.message : "Unknown error"}). Returning locally computed insights.`
+      `[CreatorAI] generateCreatorInsights: All providers failed (${error instanceof Error ? error.message : "Unknown error"}). Returning locally computed insights.`
     );
     return {
       summary: heuristicSummary,
@@ -1199,74 +1450,88 @@ export async function generateCreatorInsights(stats: ContentStat[]): Promise<Cre
  * video analysis (if needed) -> parallel hooks/clips/matches -> EDL compilation -> multi-platform adaptation.
  *
  * @param input - Configuration containing script, optional video input, transcript, and target platforms.
- * @returns A consolidated PipelineResult object containing all generated assets and diagnostic warnings.
+ * @returns A consolidated PipelineResult object containing all generated assets, per-step source, and diagnostic warnings.
  */
 export async function runCreatorPipeline(input: PipelineInput): Promise<PipelineResult> {
   const warnings: string[] = [];
   const script = input?.script ?? "";
   const targetPlatforms: Platform[] = input?.platforms && input.platforms.length > 0
     ? input.platforms
-    : ["youtube_shorts", "instagram_reels", "tiktok"];
+    : (["youtube_shorts", "instagram_reels", "tiktok"] as Platform[]);
 
-  let transcript = input?.transcript ?? "";
+  let transcript = normalizeTranscript(input?.transcript ?? "");
   let scenes: VideoScene[] | undefined = undefined;
+  let videoSource: ExecutionSource | undefined = undefined;
+  let videoProvider: ExecutionProvider | undefined = undefined;
 
   const apiKey = process.env.GEMINI_API_KEY ?? process.env.GOOGLE_API_KEY;
-  if (!apiKey || apiKey.trim() === "") {
-    warnings.push("API key is not configured; running pipeline with local heuristics and fallbacks.");
+  const groqKey = process.env.GROQ_API_KEY;
+  if ((!apiKey || apiKey.trim() === "") && (!groqKey || groqKey.trim() === "")) {
+    warnings.push("No AI API keys configured; running pipeline with local heuristics and fallbacks.");
   }
 
   // Step 1: Video Analysis (if video provided and transcript missing)
   if (!transcript && input?.video) {
-    try {
-      const videoResult = await analyzeVideo(input.video);
-      transcript = videoResult.transcript;
-      scenes = videoResult.scenes;
-      if (!transcript) {
-        warnings.push("Video transcription produced no transcript; proceeding with empty transcript.");
-      }
-    } catch (err) {
-      warnings.push(`Video analysis failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+    const videoRes = await internalAnalyzeVideo(input.video);
+    transcript = videoRes.data.transcript;
+    scenes = videoRes.data.scenes;
+    videoSource = videoRes.source;
+    videoProvider = videoRes.provider;
+    if (videoRes.warning) warnings.push(videoRes.warning);
+    if (!transcript) {
+      warnings.push("Video transcription produced no transcript; proceeding with fallback transcript.");
     }
   }
 
   // Step 2: Parallel execution of hooks, clips, and footage matching
-  const [hooks, clips, matches] = await Promise.all([
-    generateHooks(script).catch((err) => {
-      warnings.push(`Hook generation fallback triggered: ${err instanceof Error ? err.message : "Unknown error"}`);
-      return getFallbackHooks(script);
-    }),
-    suggestClips(script, transcript).catch((err) => {
-      warnings.push(`Clip suggestion fallback triggered: ${err instanceof Error ? err.message : "Unknown error"}`);
-      return getFallbackClips(script, transcript);
-    }),
-    matchScriptToFootage(script, transcript).catch((err) => {
-      warnings.push(`Script matching fallback triggered: ${err instanceof Error ? err.message : "Unknown error"}`);
-      return getFallbackMatches(script, transcript);
-    }),
+  const [hooksRes, clipsRes, matchesRes] = await Promise.all([
+    internalGenerateHooks(script),
+    internalSuggestClips(script, transcript),
+    internalMatchScriptToFootage(script, transcript),
   ]);
 
+  if (hooksRes.warning) warnings.push(hooksRes.warning);
+  if (clipsRes.warning) warnings.push(clipsRes.warning);
+  if (matchesRes.warning) warnings.push(matchesRes.warning);
+
   // Step 3: EDL Timeline compilation (pure function)
-  const primaryHook = hooks[0] ?? "";
-  const edl = buildEditDecisionList(clips, {
+  const primaryHook = hooksRes.data[0]
+    ? typeof hooksRes.data[0] === "string"
+      ? hooksRes.data[0]
+      : hooksRes.data[0].hookText
+    : "";
+
+  const edl = buildEditDecisionList(clipsRes.data, {
     hook: primaryHook,
     platform: targetPlatforms[0],
   });
 
   // Step 4: Multi-platform adaptations
-  const adaptations = await adaptContent(script, targetPlatforms).catch((err) => {
-    warnings.push(`Platform adaptation fallback triggered: ${err instanceof Error ? err.message : "Unknown error"}`);
-    return getFallbackAdaptations(script, targetPlatforms);
-  });
+  const adaptRes = await internalAdaptContent(script, targetPlatforms);
+  if (adaptRes.warning) warnings.push(adaptRes.warning);
 
   return {
-    hooks,
-    clips,
-    matches,
+    hooks: hooksRes.data,
+    clips: clipsRes.data,
+    matches: matchesRes.data,
     edl,
-    adaptations,
+    adaptations: Array.isArray(adaptRes.data) ? adaptRes.data : [],
     transcript,
     scenes,
     warnings,
+    source: {
+      videoAnalysis: videoSource,
+      generateHooks: hooksRes.source,
+      suggestClips: clipsRes.source,
+      matchScriptToFootage: matchesRes.source,
+      adaptContent: adaptRes.source,
+    },
+    provider: {
+      videoAnalysis: videoProvider,
+      generateHooks: hooksRes.provider,
+      suggestClips: clipsRes.provider,
+      matchScriptToFootage: matchesRes.provider,
+      adaptContent: adaptRes.provider,
+    },
   };
 }

@@ -45,3 +45,12 @@ next-env.d.ts
 *.db-journal
 dev.db
 dev.db-journal
+
+# media & samples
+sample.mp4
+*.mp4
+
+# persistent cache
+.cache/
+
+

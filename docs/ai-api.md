@@ -7,111 +7,74 @@ All functions interact with Google Gemini via the official `@google/genai` SDK u
 - **Lazy Initialization**: Safe to import even if `GEMINI_API_KEY` is undefined.
 - **Fail-Safe Fallbacks**: Guaranteed to return typed results and never throw exceptions.
 - **In-Memory Caching**: AI calls are cached in memory (10-minute TTL) by SHA-256 hash of inputs.
-- **Timeouts**: 20 seconds for standard queries, 120 seconds for multimodal video analysis.
+- **Timeouts & Retries**: 30s per attempt for text operations with retry backoff and model fallbacks; 120s for multimodal video analysis.
+- **Per-Step Source Tracking**: Pipeline results contain a `source` map denoting whether each individual asset was generated via `"live"` AI or `"fallback"` heuristic.
 
 ---
 
 ## Functions
 
 ### 1. `generateHooks`
-Generates exactly 3 distinct, scroll-stopping hooks (≤ 140 chars) from a script using curiosity gaps, bold claims, and pain points.
+Generates exactly 3 distinct, scroll-stopping hook options with virality score and emotional drivers.
 
 **Signature:**
 ```typescript
-function generateHooks(scriptContent: string): Promise<string[]>
+function generateHooks(scriptContent: string): Promise<HookOption[]>
 ```
 
 **Example Output:**
 ```json
 [
-  "Stop scrolling: If you want to automate short-form content, listen up.",
-  "Most creators edit clips backwards—here is the framework that gets 1M views.",
-  "Struggling to turn long videos into viral shorts? Try this 3-step system."
+  {
+    "hookText": "Stop spending 80% of your time editing! Try this AI workflow.",
+    "viralScore": 95,
+    "emotionalType": "FOMO"
+  },
+  {
+    "hookText": "Most creators edit clips completely backwards—here is what actually works.",
+    "viralScore": 91,
+    "emotionalType": "Curiosity"
+  },
+  {
+    "hookText": "Wait, why is nobody talking about automated clip generation?",
+    "viralScore": 88,
+    "emotionalType": "Pattern Interrupt"
+  }
 ]
 ```
-- **Fallback**: 3 heuristic hooks derived from the first sentence of the script.
+- **Fallback**: 3 structured heuristic hooks derived from the script.
 - **Typical Latency**: ~1.2s - 2.5s.
 
 ---
 
 ### 2. `suggestClips`
-Compares a script against a timestamped transcript and returns 3-5 high-performing clips (15-60s) sorted by confidence.
+Compares a script against a normalized timestamped transcript and returns 3-5 high-performing clips (15-60s) sorted by confidence.
 
 **Signature:**
 ```typescript
 function suggestClips(scriptContent: string, videoTranscript: string): Promise<ClipSuggestion[]>
 ```
 
-**Example Output:**
-```json
-[
-  {
-    "startTime": "00:15",
-    "endTime": "00:45",
-    "startSeconds": 15,
-    "endSeconds": 45,
-    "title": "The 3-Step Framework",
-    "reason": "Clear standalone breakdown with immediate retention value.",
-    "confidence": 0.92
-  }
-]
-```
-- **Fallback**: 2-3 clips extracted directly from transcript timestamps or default 30s segments.
-- **Typical Latency**: ~1.8s - 3.2s.
-
 ---
 
 ### 3. `adaptContent`
-Adapts a script across YouTube Shorts, Instagram Reels, TikTok, X, and LinkedIn with platform-enforced constraints.
+Adapts a script across multiple platforms (`Platform[]`) or single platforms (`'TIKTOK' | 'REELS' | 'YOUTUBE'`).
 
-**Signature:**
+**Signatures:**
 ```typescript
-function adaptContent(scriptContent: string, platforms: Platform[]): Promise<PlatformAdaptation[]>
+function adaptContent(script: string, platform: 'TIKTOK' | 'REELS' | 'YOUTUBE'): Promise<SinglePlatformAdaptation>;
+function adaptContent(scriptContent: string, platforms: Platform[]): Promise<PlatformAdaptation[]>;
 ```
-
-**Example Output:**
-```json
-[
-  {
-    "platform": "tiktok",
-    "caption": "How to scale your content without burning out 🚀 Comment your questions below!",
-    "hashtags": ["#creator", "#contentstrategy", "#automation"],
-    "hook": "Here is why your workflow is slowing you down.",
-    "aspectRatio": "9:16",
-    "maxDurationSeconds": 60,
-    "postingTip": "Hook in the first 1.5 seconds and encourage comments with a debate prompt."
-  }
-]
-```
-- **Fallback**: Platform-compliant defaults with structured formatting and standard hashtags.
-- **Typical Latency**: ~1.5s - 2.8s.
 
 ---
 
 ### 4. `matchScriptToFootage`
-Matches script narrative beats to specific transcript timestamp ranges.
+Matches script narrative beats to specific transcript timestamp ranges with normalized cue parsing.
 
 **Signature:**
 ```typescript
 function matchScriptToFootage(scriptContent: string, videoTranscript: string): Promise<ScriptFootageMatch[]>
 ```
-
-**Example Output:**
-```json
-[
-  {
-    "scriptBeat": "Problem Statement",
-    "startTime": "00:00",
-    "endTime": "00:20",
-    "startSeconds": 0,
-    "endSeconds": 20,
-    "matchScore": 0.95,
-    "note": "Speaker introduces the common editor bottleneck."
-  }
-]
-```
-- **Fallback**: Thematic segments matched against chronological transcript intervals.
-- **Typical Latency**: ~1.8s - 3.0s.
 
 ---
 
@@ -123,69 +86,25 @@ Pure timeline compiler. Combines suggested clips and hooks into an editable EDL 
 function buildEditDecisionList(clips: ClipSuggestion[], opts?: { hook?: string; platform?: Platform }): EditDecisionList
 ```
 
-**Example Output:**
-```json
-{
-  "version": 1,
-  "platform": "tiktok",
-  "items": [
-    {
-      "id": "item-hook-overlay-1",
-      "type": "hook_overlay",
-      "startSeconds": 0,
-      "endSeconds": 3,
-      "text": "Stop scrolling",
-      "editable": true
-    },
-    {
-      "id": "item-clip-1",
-      "type": "clip",
-      "startSeconds": 0,
-      "endSeconds": 30,
-      "text": "The Hook",
-      "sourceClipIndex": 0,
-      "editable": true
-    }
-  ]
-}
-```
-- **Fallback**: Deterministic synchronous execution (no AI call).
-- **Typical Latency**: < 1ms.
-
 ---
 
 ### 6. `generateCreatorInsights`
-Analyzes creator metrics and computes engagement rate + top performers locally, using AI for strategic narrative analysis.
+Analyzes creator metrics, computes engagement rate + top performers locally, and generates narrative analysis.
 
 **Signature:**
 ```typescript
 function generateCreatorInsights(stats: ContentStat[]): Promise<CreatorInsights>
 ```
 
-**Example Output:**
-```json
-{
-  "summary": "Analyzed 10 posts with 120,000 total views. High-energy shorts drove 75% of engagement.",
-  "topPerformers": ["How to automate editing in 60s", "Top 5 AI tools"],
-  "patterns": ["Videos under 40 seconds saw 2x higher retention."],
-  "recommendations": ["Replicate hook style from top performer for upcoming series."],
-  "bestPostingWindow": "2:00 PM - 5:00 PM (peak audience activity)"
-}
-```
-- **Fallback**: Computes performance metrics locally and generates rule-based insights.
-- **Typical Latency**: ~1.2s - 2.0s.
-
 ---
 
 ### 7. `analyzeVideo`
-Transcribes footage into `[MM:SS] text` lines and extracts visual scenes using Gemini multimodal video processing.
+Transcribes footage into `[MM:SS] text` lines and extracts visual scenes using Gemini multimodal video processing with upload lifecycle management.
 
 **Signature:**
 ```typescript
 function analyzeVideo(input: VideoAnalysisInput): Promise<VideoAnalysis>
 ```
-- **Fallback**: Empty transcript and scene list.
-- **Typical Latency**: ~15s - 60s (depending on video size).
 
 ---
 
@@ -197,11 +116,51 @@ End-to-end orchestration pipeline running video transcription, parallel hook/cli
 function runCreatorPipeline(input: PipelineInput): Promise<PipelineResult>
 ```
 
+**Pipeline Result Structure:**
+```typescript
+export type PipelineResult = {
+  hooks: HookOption[] | string[];
+  clips: ClipSuggestion[];
+  matches: ScriptFootageMatch[];
+  edl: EditDecisionList;
+  adaptations: PlatformAdaptation[];
+  transcript: string;
+  scenes?: VideoScene[];
+  warnings: string[];
+  source: {
+    videoAnalysis?: "live" | "fallback";
+    generateHooks: "live" | "fallback";
+    suggestClips: "live" | "fallback";
+    matchScriptToFootage: "live" | "fallback";
+    adaptContent: "live" | "fallback";
+  };
+  provider: {
+    videoAnalysis?: "gemini" | "groq" | "fallback";
+    generateHooks: "gemini" | "groq" | "fallback";
+    suggestClips: "gemini" | "groq" | "fallback";
+    matchScriptToFootage: "gemini" | "groq" | "fallback";
+    adaptContent: "gemini" | "groq" | "fallback";
+  };
+};
+```
+
+---
+
+## Environment Variables & Model Chain
+
+- `GEMINI_API_KEY`: Primary API key for Gemini models.
+- `GEMINI_MODEL`: Primary text/multimodal model (default `gemini-2.5-flash`).
+- `GEMINI_FALLBACK_MODELS`: Comma-separated fallback models (default `gemini-2.5-flash-lite`).
+- `GROQ_API_KEY`: API key for Groq fallback provider (optional, skipped if unset).
+- `GROQ_MODEL`: Model identifier for Groq fetch completions (default `llama-3.3-70b-versatile`).
+- `AI_DISK_CACHE`: Toggle persistent 24h disk caching in `.cache/ai/` (`0` disables disk cache, default enabled).
+
+**Provider Chain for Text Generation:**
+`GEMINI_MODEL` ➔ `GEMINI_FALLBACK_MODELS` ➔ `Groq` ➔ `Local Heuristic Fallback`.
+
 ---
 
 ## Calling from a Next.js route handler
-
-Here is a standard Next.js App Router route handler pattern:
 
 ```typescript
 import { NextResponse } from "next/server";
